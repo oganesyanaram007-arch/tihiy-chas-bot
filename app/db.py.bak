@@ -1,0 +1,120 @@
+# -*- coding: utf-8 -*-
+"""База данных «Тихий Час»: SQLAlchemy 2.0 async. SQLite для MVP,
+для продакшена меняется одна строка DB_URL на PostgreSQL."""
+from __future__ import annotations
+import datetime as dt
+from sqlalchemy import (BigInteger, Boolean, Date, DateTime, ForeignKey, Integer,
+                        String, select, func)
+from sqlalchemy.ext.asyncio import (AsyncSession, async_sessionmaker,
+                                    create_async_engine)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+from .config import DB_URL
+
+engine = create_async_engine(DB_URL, echo=False)
+Session = async_sessionmaker(engine, expire_on_commit=False)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)  # tg id
+    name: Mapped[str] = mapped_column(String(128), default="Гость")
+    points: Mapped[int] = mapped_column(Integer, default=0)
+    visits: Mapped[int] = mapped_column(Integer, default=0)
+    ref_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+
+class Venue(Base):
+    __tablename__ = "venues"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(64))
+    cat: Mapped[str] = mapped_column(String(16))        # food/coffee/beauty/spa/fun/auto
+    district: Mapped[str] = mapped_column(String(16), default="petro")  # район, как на сайте
+    place: Mapped[str] = mapped_column(String(128))
+    check_note: Mapped[str] = mapped_column(String(64)) # "чек ~1 800 ₽"
+    left_note: Mapped[str] = mapped_column(String(64))  # "осталось 4 стола"
+    weekdays: Mapped[str] = mapped_column(String(16), default="0,1,2,3,4")  # 0=пн..6=вс, через запятую
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class Slot(Base):
+    __tablename__ = "slots"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    venue_id: Mapped[int] = mapped_column(ForeignKey("venues.id"))
+    hour: Mapped[int] = mapped_column(Integer)          # 15
+    discount: Mapped[int] = mapped_column(Integer)      # 40
+
+
+class Booking(Base):
+    __tablename__ = "bookings"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(12), unique=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    venue_id: Mapped[int] = mapped_column(ForeignKey("venues.id"))
+    slot_id: Mapped[int] = mapped_column(ForeignKey("slots.id"))
+    visit_date: Mapped[dt.date] = mapped_column(Date, default=dt.date.today)  # на какой день бронь
+    status: Mapped[str] = mapped_column(String(12), default="active")  # active/cancelled/visited
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+
+class PartnerLead(Base):
+    __tablename__ = "partner_leads"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tg_user: Mapped[int] = mapped_column(BigInteger)
+    name: Mapped[str] = mapped_column(String(128))
+    phone: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(12), default="new")
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+
+class PointsLedger(Base):
+    __tablename__ = "points_ledger"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    delta: Mapped[int] = mapped_column(Integer)
+    reason: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+
+async def init_db() -> None:
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
+async def get_or_create_user(s: AsyncSession, tg_id: int, name: str) -> tuple[User, bool]:
+    u = await s.get(User, tg_id)
+    if u:
+        return u, False
+    u = User(id=tg_id, name=name)
+    s.add(u)
+    await s.flush()
+    return u, True
+
+
+async def add_points(s: AsyncSession, user: User, delta: int, reason: str) -> None:
+    user.points += delta
+    s.add(PointsLedger(user_id=user.id, delta=delta, reason=reason))
+
+
+async def user_visited_venue(s: AsyncSession, user_id: int, venue_id: int) -> bool:
+    q = select(func.count(Booking.id)).where(
+        Booking.user_id == user_id,
+        Booking.venue_id == venue_id,
+        Booking.status == "visited",
+    )
+    return (await s.scalar(q) or 0) > 0
+
+
+def venue_weekdays(venue: Venue) -> set[int]:
+    """Дни недели (0=пн..6=вс), когда у заведения действуют тихие часы."""
+    return {int(x) for x in venue.weekdays.split(",") if x.strip() != ""}
+
+
+def works_on(venue: Venue, date: dt.date) -> bool:
+    """Работает ли заведение по тихому часу в этот день."""
+    return date.weekday() in venue_weekdays(venue)

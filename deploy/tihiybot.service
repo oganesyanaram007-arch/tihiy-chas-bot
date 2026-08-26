@@ -1,0 +1,26 @@
+; Systemd-юнит бота «Тихий Час». Держит процесс живым и поднимает его
+; заново после сбоя или перезагрузки сервера.
+;
+; Установка на VPS:
+;   sudo cp deploy/tihiybot.service /etc/systemd/system/
+;   sudo systemctl daemon-reload
+;   sudo systemctl enable --now tihiybot
+;
+; Логи:  journalctl -u tihiybot -f
+; Рестарт после правки кода:  sudo systemctl restart tihiybot
+
+[Unit]
+Description=Tihiy Chas — Telegram bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/tihiy-bot
+EnvironmentFile=/root/tihiy-bot/.env
+ExecStart=/root/tihiy-bot/.venv/bin/python -m app.main
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

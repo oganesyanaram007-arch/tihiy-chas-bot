@@ -1,0 +1,26 @@
+; Systemd-юнит API «Тихий Час» — FastAPI-бэкенд, который принимает
+; заявки с сайта (форма регистрации) и обслуживает кабинет партнёра.
+; Слушает 127.0.0.1:8080, наружу смотрит через nginx (см. nginx.conf).
+;
+; Установка на VPS:
+;   sudo cp deploy/tihiyapi.service /etc/systemd/system/
+;   sudo systemctl daemon-reload
+;   sudo systemctl enable --now tihiyapi
+;
+; Логи:  journalctl -u tihiyapi -f
+
+[Unit]
+Description=Tihiy Chas — API (форма регистрации + кабинет партнёра)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/tihiy-bot
+EnvironmentFile=/root/tihiy-bot/.env
+ExecStart=/root/tihiy-bot/.venv/bin/uvicorn app.api:api --host 127.0.0.1 --port 8080
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
