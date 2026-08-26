@@ -7,3 +7,6 @@ __pycache__/
 *.db.backup*
 *.sqlite3
 .DS_Store
+*.bak
+*.bak[0-9]
+*.backup-*
