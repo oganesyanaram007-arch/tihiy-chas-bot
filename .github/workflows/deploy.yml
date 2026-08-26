@@ -1,0 +1,27 @@
+name: Deploy bot and API
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            cd /root/tihiy-bot
+            cp tihiy.db tihiy.db.autodeploy-$(date +%Y%m%d-%H%M%S)
+            git fetch origin main
+            git reset --hard origin/main
+            .venv/bin/pip install -q -r requirements.txt
+            systemctl restart tihiyapi
+            systemctl restart tihiybot
+            sleep 3
+            systemctl is-active tihiyapi tihiybot
+            echo "Bot and API deployed"
