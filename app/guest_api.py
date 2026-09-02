@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import base64
 import datetime as dt
 import html
 import random
@@ -27,7 +28,8 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query, Response
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
@@ -35,7 +37,7 @@ from .auth import AuthError, verify_init_data
 from .config import ADMIN_IDS, BOT_TOKEN
 from .db import (Booking, PointsLedger, Session, Slot, User, Venue, WebSession,
                  add_points, get_or_create_user, works_on)
-from .models_partner import PartnerUser, VenueProfile, QuietWindow
+from .models_partner import PartnerUser, VenueProfile, QuietWindow, VenuePhoto
 from .webauth import _cookie as _web_token_var, _digest as _web_digest
 
 router = APIRouter(prefix="/api/guest", tags=["guest"])
@@ -100,10 +102,10 @@ async def current_guest(x_init_data: str = Header(default="", alias="X-Init-Data
     raise HTTPException(status_code=401, detail="Нужен вход")
 
 
-def _venue_json(v: Venue, slots: list[Slot]) -> dict:
+def _venue_json(v: Venue, slots: list[Slot], has_photo: bool = False) -> dict:
     """Формат совпадает с тем, что мини-апп раньше держал в коде,
     чтобы фронт не пришлось переписывать целиком."""
-    return {
+    out = {
         "id": v.id,
         "cat": v.cat,
         "d": v.district,
@@ -116,6 +118,45 @@ def _venue_json(v: Venue, slots: list[Slot]) -> dict:
         "wd": sorted({(int(x) + 1) % 7 for x in v.weekdays.split(",") if x.strip() != ""}),
         "slots": [[sl.hour, sl.discount] for sl in sorted(slots, key=lambda x: x.hour)],
     }
+    # Ссылка, а не сам снимок: фото лежит в базе как data-URL на сотни
+    # килобайт, и вшивать его в список заведений — раздуть витрину в разы.
+    if has_photo:
+        out["photo"] = f"/api/guest/venue-photo/{v.id}"
+    return out
+
+
+@router.get("/venue-photo/{venue_id}")
+async def venue_photo(venue_id: int):
+    """Обложка заведения для витрины.
+
+    Отдельным запросом, чтобы браузер кэшировал картинку, а лента
+    оставалась лёгкой. Партнёр грузит снимок из кабинета — сюда он
+    попадает тем же путём, каким его сохранил cabinet.py.
+    """
+    async with Session() as s:
+        url = await s.scalar(
+            select(VenuePhoto.url)
+            .where(VenuePhoto.venue_id == venue_id)
+            .order_by(VenuePhoto.sort_order, VenuePhoto.id)
+            .limit(1)
+        )
+        if not url:
+            # Запасной путь: у старых карточек обложка могла осесть только здесь.
+            url = await s.scalar(
+                select(VenueProfile.cover_url).where(VenueProfile.venue_id == venue_id)
+            )
+    if not url:
+        raise HTTPException(status_code=404, detail="Нет фото")
+    if not url.startswith("data:"):
+        return RedirectResponse(url)
+    try:
+        head, b64 = url.split(",", 1)
+        media = head[5:].split(";", 1)[0] or "image/jpeg"
+        raw = base64.b64decode(b64)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Фото повреждено")
+    return Response(content=raw, media_type=media,
+                    headers={"Cache-Control": "public, max-age=86400"})
 
 
 @router.get("/venues")
@@ -125,10 +166,21 @@ async def venues():
         rows = (await s.scalars(select(Venue).where(Venue.active.is_(True)))).all()
         ids = [v.id for v in rows]
         slots = (await s.scalars(select(Slot).where(Slot.venue_id.in_(ids)))).all() if ids else []
+        with_photo: set[int] = set()
+        if ids:
+            with_photo |= set((await s.scalars(
+                select(VenuePhoto.venue_id).where(VenuePhoto.venue_id.in_(ids)).distinct()
+            )).all())
+            with_photo |= set((await s.scalars(
+                select(VenueProfile.venue_id).where(
+                    VenueProfile.venue_id.in_(ids), VenueProfile.cover_url != ""
+                )
+            )).all())
     by_venue: dict[int, list[Slot]] = defaultdict(list)
     for sl in slots:
         by_venue[sl.venue_id].append(sl)
-    out = [_venue_json(v, by_venue.get(v.id, [])) for v in rows if by_venue.get(v.id)]
+    out = [_venue_json(v, by_venue.get(v.id, []), v.id in with_photo)
+           for v in rows if by_venue.get(v.id)]
     return {"deposit": DEPOSIT, "horizon": HORIZON_DAYS, "venues": out}
 
 
