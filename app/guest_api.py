@@ -20,9 +20,10 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import html
+import io
 import random
 from asyncio import Lock
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot
@@ -102,7 +103,7 @@ async def current_guest(x_init_data: str = Header(default="", alias="X-Init-Data
     raise HTTPException(status_code=401, detail="Нужен вход")
 
 
-def _venue_json(v: Venue, slots: list[Slot], has_photo: bool = False) -> dict:
+def _venue_json(v: Venue, slots: list[Slot], photo_ver: int | None = None) -> dict:
     """Формат совпадает с тем, что мини-апп раньше держал в коде,
     чтобы фронт не пришлось переписывать целиком."""
     out = {
@@ -120,19 +121,89 @@ def _venue_json(v: Venue, slots: list[Slot], has_photo: bool = False) -> dict:
     }
     # Ссылка, а не сам снимок: фото лежит в базе как data-URL на сотни
     # килобайт, и вшивать его в список заведений — раздуть витрину в разы.
-    if has_photo:
-        out["photo"] = f"/api/guest/venue-photo/{v.id}"
+    if photo_ver is not None:
+        # v= — метка версии: при замене снимка адрес меняется, и ни кэш
+        # браузера, ни наш собственный не отдадут прежнюю картинку.
+        out["photo"] = f"/api/guest/venue-photo/{v.id}?w=500&v={photo_ver}"
     return out
 
 
+# Готовые обложки держим в памяти: снимок в базе меняется редко, а
+# разжимать и уменьшать мегабайт на каждый заход гостя незачем.
+# Предел считаем в байтах, а не в записях: на сервере 2 ГБ памяти и нет
+# swap, а один оригинал весит под мегабайт — по счётчику записей кэш мог
+# бы съесть сотни мегабайт и уронить процесс.
+_PHOTO_CACHE: "OrderedDict[tuple[int, int, int], tuple[bytes, str]]" = OrderedDict()
+_PHOTO_CACHE_BYTES = 0
+_PHOTO_CACHE_LIMIT = 48 * 1024 * 1024      # 48 МБ на все обложки
+_PHOTO_ITEM_LIMIT = 4 * 1024 * 1024        # штуку крупнее в кэш не берём
+
+
+def invalidate_photo_cache(venue_id: int) -> None:
+    """Кабинет зовёт это, когда снимок добавили или удалили."""
+    global _PHOTO_CACHE_BYTES
+    for k in [k for k in _PHOTO_CACHE if k[0] == venue_id]:
+        item = _PHOTO_CACHE.pop(k, None)
+        if item:
+            _PHOTO_CACHE_BYTES -= len(item[0])
+
+
+def _cache_put(key, data: bytes, media: str) -> None:
+    """Положить обложку в кэш, вытесняя самые давние, пока не влезет."""
+    global _PHOTO_CACHE_BYTES
+    if len(data) > _PHOTO_ITEM_LIMIT:
+        return
+    old = _PHOTO_CACHE.pop(key, None)
+    if old:
+        _PHOTO_CACHE_BYTES -= len(old[0])
+    _PHOTO_CACHE[key] = (data, media)
+    _PHOTO_CACHE_BYTES += len(data)
+    while _PHOTO_CACHE_BYTES > _PHOTO_CACHE_LIMIT and _PHOTO_CACHE:
+        _, victim = _PHOTO_CACHE.popitem(last=False)
+        _PHOTO_CACHE_BYTES -= len(victim[0])
+
+
+def _shrink(raw: bytes, width: int):
+    """Уменьшить снимок до ширины width. None — если Pillow недоступен
+    или картинку не удалось прочитать: тогда отдаём оригинал как есть."""
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    try:
+        im = Image.open(io.BytesIO(raw))
+        im.load()
+        if im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
+        if im.width > width:
+            h = max(1, round(im.height * width / im.width))
+            im = im.resize((width, h), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=74, optimize=True, progressive=True)
+        return buf.getvalue(), "image/jpeg"
+    except Exception:
+        return None
+
+
 @router.get("/venue-photo/{venue_id}")
-async def venue_photo(venue_id: int):
+async def venue_photo(venue_id: int, w: int = Query(default=0, ge=0, le=2000),
+                      v: int = Query(default=0)):
     """Обложка заведения для витрины.
 
     Отдельным запросом, чтобы браузер кэшировал картинку, а лента
     оставалась лёгкой. Партнёр грузит снимок из кабинета — сюда он
     попадает тем же путём, каким его сохранил cabinet.py.
+
+    ?w=500 отдаёт уменьшенную копию: в карточке ленты снимок занимает
+    около 360 px, и гонять ради неё исходный мегабайт по медленному
+    каналу нельзя — уменьшенная весит примерно в одиннадцать раз меньше.
+    Без параметра отдаётся оригинал.
     """
+    key = (venue_id, w, v)
+    hit = _PHOTO_CACHE.get(key)
+    if hit:
+        return Response(content=hit[0], media_type=hit[1],
+                        headers={"Cache-Control": "public, max-age=86400"})
     async with Session() as s:
         url = await s.scalar(
             select(VenuePhoto.url)
@@ -155,6 +226,11 @@ async def venue_photo(venue_id: int):
         raw = base64.b64decode(b64)
     except Exception:
         raise HTTPException(status_code=404, detail="Фото повреждено")
+    if w:
+        small = _shrink(raw, w)
+        if small:
+            raw, media = small
+    _cache_put(key, raw, media)
     return Response(content=raw, media_type=media,
                     headers={"Cache-Control": "public, max-age=86400"})
 
@@ -166,20 +242,31 @@ async def venues():
         rows = (await s.scalars(select(Venue).where(Venue.active.is_(True)))).all()
         ids = [v.id for v in rows]
         slots = (await s.scalars(select(Slot).where(Slot.venue_id.in_(ids)))).all() if ids else []
-        with_photo: set[int] = set()
+        cover: dict[int, int] = {}
         if ids:
-            with_photo |= set((await s.scalars(
-                select(VenuePhoto.venue_id).where(VenuePhoto.venue_id.in_(ids)).distinct()
-            )).all())
-            with_photo |= set((await s.scalars(
-                select(VenueProfile.venue_id).where(
-                    VenueProfile.venue_id.in_(ids), VenueProfile.cover_url != ""
-                )
-            )).all())
+            first_photo: dict[int, int] = {}
+            for vid, pid in (await s.execute(
+                select(VenuePhoto.venue_id, VenuePhoto.id)
+                .where(VenuePhoto.venue_id.in_(ids))
+                .order_by(VenuePhoto.sort_order, VenuePhoto.id)
+            )).all():
+                first_photo.setdefault(vid, pid)
+            prof = {vid: (upd, cov) for vid, upd, cov in (await s.execute(
+                select(VenueProfile.venue_id, VenueProfile.updated_at,
+                       VenueProfile.cover_url).where(VenueProfile.venue_id.in_(ids))
+            )).all()}
+            for vid in ids:
+                upd, cov = prof.get(vid, (None, ""))
+                if vid not in first_photo and not cov:
+                    continue
+                # Версия — момент последней правки снимков, а не id строки:
+                # SQLite переиспользует id после удаления, и при замене фото
+                # адрес остался бы прежним, а браузер сутки отдавал бы старое.
+                cover[vid] = int(upd.timestamp()) if upd else first_photo.get(vid, 0)
     by_venue: dict[int, list[Slot]] = defaultdict(list)
     for sl in slots:
         by_venue[sl.venue_id].append(sl)
-    out = [_venue_json(v, by_venue.get(v.id, []), v.id in with_photo)
+    out = [_venue_json(v, by_venue.get(v.id, []), cover.get(v.id))
            for v in rows if by_venue.get(v.id)]
     return {"deposit": DEPOSIT, "horizon": HORIZON_DAYS, "venues": out}
 

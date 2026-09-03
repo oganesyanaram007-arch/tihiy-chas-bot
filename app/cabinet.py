@@ -276,15 +276,59 @@ async def login(body: JoinIn):
         }
 
 
+async def _linked_web_user(s, pu: PartnerUser):
+    """Учётка сайта, привязанная к партнёру. У партнёров, заведённых через
+    сайт, PartnerUser.tg_id хранит id из users — оттуда берётся почта.
+    У пришедших из Telegram такой записи нет, и это нормально."""
+    web = await s.get(User, pu.tg_id)
+    return web if (web and web.role == "partner") else None
+
+
 @router.get("/me")
 async def me(x_init_data: str = Header(default="", alias="X-Init-Data")):
     ctx = await current_user(x_init_data)
     u, p = ctx["user"], ctx["partner"]
+    async with Session() as s:
+        web = await _linked_web_user(s, u)
     return {
-        "user": {"id": u.id, "name": u.name, "role": u.role, "username": u.username},
+        # phone и email нужны экрану профиля: без них поля стояли пустыми,
+        # хотя телефон лежит в базе.
+        "user": {"id": u.id, "name": u.name, "role": u.role, "username": u.username,
+                 "phone": u.phone or "", "email": (web.email if web else "") or ""},
         "partner": {"id": p.id, "title": p.title, "status": p.status,
                     "tariff": p.tariff, "inn": p.inn},
     }
+
+
+class CabProfileIn(BaseModel):
+    name: str = Field(default="", max_length=128)
+    phone: str = Field(default="", max_length=32)
+
+
+@router.patch("/profile")
+async def update_cab_profile(body: CabProfileIn,
+                             x_init_data: str = Header(default="", alias="X-Init-Data")):
+    """Правка контактов владельца из кабинета.
+
+    Отдельно от /api/auth/profile: тот работает только по куке сайта, а в
+    кабинет пускают ещё и по подписи Telegram, и по куке бота. Партнёр из
+    Telegram получал бы там 401 и вылетал на страницу входа.
+    """
+    ctx = await current_user(x_init_data)
+    async with Session() as s:
+        u = await s.get(PartnerUser, ctx["user"].id)
+        name, phone = body.name.strip(), body.phone.strip()
+        if name:
+            u.name = name[:128]
+        u.phone = phone[:32]
+        web = await _linked_web_user(s, u)
+        if web:                      # держим обе учётки в согласии
+            if name:
+                web.name = name[:128]
+            web.phone = u.phone
+        await s.commit()
+        return {"ok": True, "user": {"name": u.name, "phone": u.phone,
+                                     "email": (web.email if web else "") or ""}}
 
 
 class InviteIn(BaseModel):
@@ -336,7 +380,9 @@ async def _owned_venue(s, ctx, venue_id: int) -> tuple[Venue, VenueProfile]:
     return venue, profile
 
 
-def _venue_out(v: Venue, p: VenueProfile, photos: list[str], windows: list[dict]) -> dict:
+def _venue_out(v: Venue, p: VenueProfile, photos: list, windows: list[dict]) -> dict:
+    """photos — список {"id": ..., "url": ...}. Раньше отдавались голые строки,
+    и кабинет не мог удалить снимок: у него не было id для DELETE."""
     return {
         "id": v.id, "name": v.name, "cat": v.cat, "cat_label": CAT_LABEL.get(v.cat, v.cat),
         "district": p.district, "address": p.address, "phone": p.phone, "url": p.url,
@@ -380,13 +426,14 @@ async def get_venue(venue_id: int, x_init_data: str = Header(default="", alias="
     ctx = await current_user(x_init_data)
     async with Session() as s:
         v, p = await _owned_venue(s, ctx, venue_id)
-        photos = (await s.scalars(select(VenuePhoto.url).where(
-            VenuePhoto.venue_id == venue_id).order_by(VenuePhoto.sort_order))).all()
+        rows = (await s.execute(select(VenuePhoto.id, VenuePhoto.url).where(
+            VenuePhoto.venue_id == venue_id).order_by(VenuePhoto.sort_order, VenuePhoto.id))).all()
+        photos = [{"id": pid, "url": purl} for pid, purl in rows]
         wins = (await s.scalars(select(QuietWindow).where(
             QuietWindow.venue_id == venue_id, QuietWindow.active.is_(True)))).all()
         windows = [{"weekday": w.weekday, "hour": w.hour, "discount": w.discount,
                    "capacity": w.capacity} for w in wins]
-        return _venue_out(v, p, list(photos), windows)
+        return _venue_out(v, p, photos, windows)
 
 
 @router.post("/venues")
@@ -465,8 +512,12 @@ async def add_photo(venue_id: int, body: PhotoIn,
         s.add(photo)
         if count == 0:
             p.cover_url = body.data_url
+        p.updated_at = dt.datetime.utcnow()   # метка версии обложки для витрины
         await s.commit()
-        return {"ok": True, "photo_id": photo.id, "is_cover": count == 0}
+        pid = photo.id
+    from .guest_api import invalidate_photo_cache
+    invalidate_photo_cache(venue_id)
+    return {"ok": True, "photo_id": pid, "is_cover": count == 0}
 
 
 @router.delete("/venues/{venue_id}/photos/{photo_id}")
@@ -479,8 +530,18 @@ async def delete_photo(venue_id: int, photo_id: int,
         if not photo or photo.venue_id != venue_id:
             raise HTTPException(status_code=404, detail="Фото не найдено")
         await s.delete(photo)
+        await s.flush()
+        # Обложка профиля — копия первого снимка. Если её не пересобрать,
+        # витрина продолжит показывать удалённое фото через запасной путь.
+        rest = (await s.scalars(select(VenuePhoto.url).where(
+            VenuePhoto.venue_id == venue_id).order_by(
+            VenuePhoto.sort_order, VenuePhoto.id))).all()
+        p.cover_url = rest[0] if rest else ""
+        p.updated_at = dt.datetime.utcnow()   # метка версии обложки для витрины
         await s.commit()
-        return {"ok": True}
+    from .guest_api import invalidate_photo_cache
+    invalidate_photo_cache(venue_id)
+    return {"ok": True, "photos_left": len(rest)}
 
 
 # ---------- Шаг 3: тихие часы ----------
