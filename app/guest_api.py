@@ -103,7 +103,8 @@ async def current_guest(x_init_data: str = Header(default="", alias="X-Init-Data
     raise HTTPException(status_code=401, detail="Нужен вход")
 
 
-def _venue_json(v: Venue, slots: list[Slot], photo_ver: int | None = None) -> dict:
+def _venue_json(v: Venue, slots: list[Slot], photo_ver: int | None = None,
+                photo_count: int = 0) -> dict:
     """Формат совпадает с тем, что мини-апп раньше держал в коде,
     чтобы фронт не пришлось переписывать целиком."""
     out = {
@@ -125,6 +126,9 @@ def _venue_json(v: Venue, slots: list[Slot], photo_ver: int | None = None) -> di
         # v= — метка версии: при замене снимка адрес меняется, и ни кэш
         # браузера, ни наш собственный не отдадут прежнюю картинку.
         out["photo"] = f"/api/guest/venue-photo/{v.id}?w=500&v={photo_ver}"
+        # Сколько всего снимков: гость должен видеть заведение целиком,
+        # а не одну обложку. По этому числу фронт рисует листалку.
+        out["photos"] = max(1, photo_count)
     return out
 
 
@@ -133,7 +137,7 @@ def _venue_json(v: Venue, slots: list[Slot], photo_ver: int | None = None) -> di
 # Предел считаем в байтах, а не в записях: на сервере 2 ГБ памяти и нет
 # swap, а один оригинал весит под мегабайт — по счётчику записей кэш мог
 # бы съесть сотни мегабайт и уронить процесс.
-_PHOTO_CACHE: "OrderedDict[tuple[int, int, int], tuple[bytes, str]]" = OrderedDict()
+_PHOTO_CACHE: "OrderedDict[tuple[int, int, int, int], tuple[bytes, str]]" = OrderedDict()
 _PHOTO_CACHE_BYTES = 0
 _PHOTO_CACHE_LIMIT = 48 * 1024 * 1024      # 48 МБ на все обложки
 _PHOTO_ITEM_LIMIT = 4 * 1024 * 1024        # штуку крупнее в кэш не берём
@@ -187,7 +191,7 @@ def _shrink(raw: bytes, width: int):
 
 @router.get("/venue-photo/{venue_id}")
 async def venue_photo(venue_id: int, w: int = Query(default=0, ge=0, le=2000),
-                      v: int = Query(default=0)):
+                      v: int = Query(default=0), i: int = Query(default=0, ge=0, le=20)):
     """Обложка заведения для витрины.
 
     Отдельным запросом, чтобы браузер кэшировал картинку, а лента
@@ -199,7 +203,7 @@ async def venue_photo(venue_id: int, w: int = Query(default=0, ge=0, le=2000),
     каналу нельзя — уменьшенная весит примерно в одиннадцать раз меньше.
     Без параметра отдаётся оригинал.
     """
-    key = (venue_id, w, v)
+    key = (venue_id, w, v, i)
     hit = _PHOTO_CACHE.get(key)
     if hit:
         return Response(content=hit[0], media_type=hit[1],
@@ -209,7 +213,7 @@ async def venue_photo(venue_id: int, w: int = Query(default=0, ge=0, le=2000),
             select(VenuePhoto.url)
             .where(VenuePhoto.venue_id == venue_id)
             .order_by(VenuePhoto.sort_order, VenuePhoto.id)
-            .limit(1)
+            .offset(i).limit(1)
         )
         if not url:
             # Запасной путь: у старых карточек обложка могла осесть только здесь.
@@ -243,6 +247,7 @@ async def venues():
         ids = [v.id for v in rows]
         slots = (await s.scalars(select(Slot).where(Slot.venue_id.in_(ids)))).all() if ids else []
         cover: dict[int, int] = {}
+        photo_n: dict[int, int] = {}
         if ids:
             first_photo: dict[int, int] = {}
             for vid, pid in (await s.execute(
@@ -251,6 +256,7 @@ async def venues():
                 .order_by(VenuePhoto.sort_order, VenuePhoto.id)
             )).all():
                 first_photo.setdefault(vid, pid)
+                photo_n[vid] = photo_n.get(vid, 0) + 1
             prof = {vid: (upd, cov) for vid, upd, cov in (await s.execute(
                 select(VenueProfile.venue_id, VenueProfile.updated_at,
                        VenueProfile.cover_url).where(VenueProfile.venue_id.in_(ids))
@@ -266,7 +272,7 @@ async def venues():
     by_venue: dict[int, list[Slot]] = defaultdict(list)
     for sl in slots:
         by_venue[sl.venue_id].append(sl)
-    out = [_venue_json(v, by_venue.get(v.id, []), cover.get(v.id))
+    out = [_venue_json(v, by_venue.get(v.id, []), cover.get(v.id), photo_n.get(v.id, 0))
            for v in rows if by_venue.get(v.id)]
     return {"deposit": DEPOSIT, "horizon": HORIZON_DAYS, "venues": out}
 
