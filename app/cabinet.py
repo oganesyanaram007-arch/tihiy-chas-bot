@@ -20,6 +20,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, select
 
+from . import booking_flow
 from .auth import AuthError, verify_init_data
 from .config import ADMIN_IDS, BOT_TOKEN
 from .db import Booking, Session, Slot, User, Venue, WebSession, add_points
@@ -499,7 +500,11 @@ async def add_photo(venue_id: int, body: PhotoIn,
     except Exception:
         raise HTTPException(status_code=400, detail="Не удалось прочитать изображение")
     if raw_len > MAX_PHOTO_BYTES:
-        raise HTTPException(status_code=413, detail="Фото слишком большое, до 1.5 МБ")
+        # Предел и текст берутся из одного места: раньше лимит подняли до 8 МБ,
+        # а сообщение осталось про 1.5 МБ — партнёр не понимал, что не так.
+        raise HTTPException(
+            status_code=413,
+            detail=f"Фото слишком большое, до {MAX_PHOTO_BYTES // 1_000_000} МБ")
 
     async with Session() as s:
         v, p = await _owned_venue(s, ctx, venue_id)
@@ -695,29 +700,37 @@ class VisitIn(BaseModel):
     booking_id: int
 
 
+class RedeemIn(BaseModel):
+    code: str = Field(min_length=2, max_length=32)
+
+
 @router.post("/bookings/visit")
 async def confirm_visit(body: VisitIn, ctx=Depends(current_user)):
-    """Подтверждение визита из кабинета — аналог /visit КОД в боте."""
-    partner = ctx["partner"]
-    async with Session() as s:
-        bk = await s.get(Booking, body.booking_id)
-        if not bk:
-            raise HTTPException(status_code=404, detail="Бронь не найдена")
-        prof = await s.scalar(select(VenueProfile).where(
-            VenueProfile.venue_id == bk.venue_id))
-        if not prof or prof.partner_id != partner.id:
-            raise HTTPException(status_code=403, detail="Это бронь другого заведения")
-        if bk.status == "visited":
-            raise HTTPException(status_code=409, detail="Визит уже отмечен")
-        if bk.status != "active":
-            raise HTTPException(status_code=409, detail="Бронь отменена")
-        bk.status = "visited"
-        guest = await s.get(User, bk.user_id)
-        if guest:
-            guest.visits += 1
-            await add_points(s, guest, 30, "visit")
-        s.add(AuditLog(partner_user_id=ctx["user"].id, partner_id=partner.id,
-                       action="visit_confirm", entity="booking", entity_id=bk.id,
-                       payload=bk.code))
-        await s.commit()
-    return {"ok": True}
+    """Кнопка «Пришёл» напротив брони в списке.
+
+    Окно действия кода тут не проверяем: сотрудник смотрит на конкретную
+    бронь своего заведения и уже вошёл в кабинет. Смену часто закрывают
+    в конце, и отказывать в отметке из-за получаса — значит заставить
+    людей вести учёт мимо системы.
+    """
+    out = await booking_flow.redeem("", partner_id=ctx["partner"].id,
+                                    partner_user_id=ctx["user"].id,
+                                    booking_id=body.booking_id,
+                                    enforce_window=False)
+    if not out.ok:
+        raise HTTPException(status_code=out.http, detail=out.message)
+    return {"ok": True, "booking": out.booking, "message": out.message}
+
+
+@router.post("/bookings/redeem")
+async def redeem_code(body: RedeemIn, ctx=Depends(current_user)):
+    """Погашение по коду: гость называет его вслух, сотрудник вводит.
+
+    Сюда же приходит результат сканирования QR — камера лишь подставляет
+    код в то же поле, отдельного пути для QR нет.
+    """
+    out = await booking_flow.redeem(body.code, partner_id=ctx["partner"].id,
+                                    partner_user_id=ctx["user"].id)
+    if not out.ok:
+        raise HTTPException(status_code=out.http, detail=out.message)
+    return {"ok": True, "booking": out.booking, "message": out.message}

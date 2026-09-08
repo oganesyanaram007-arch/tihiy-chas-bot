@@ -18,7 +18,8 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton as B, InlineKeyboa
 from sqlalchemy import delete, select
 
 from ..config import ADMIN_IDS, PTS_NEW_MULT, PTS_VISIT
-from ..db import (Booking, PartnerLead, Session, Slot, Venue, add_points,
+from .. import booking_flow
+from ..db import (Booking, PartnerLead, Session, Slot, User, Venue, add_points,
                   get_or_create_user, user_visited_venue)
 from ..keyboards import DIST_NAME, MenuCB, kb_back
 from ..models_partner import AuditLog, Partner, PartnerUser, QuietWindow, VenuePhoto, VenueProfile
@@ -103,29 +104,25 @@ async def confirm_visit(m: Message):
     parts = m.text.split(maxsplit=1)
     if len(parts) < 2:
         return await m.answer("Формат: /visit ТЧ-1234")
-    code = parts[1].strip().upper()
+    # Сам переход живёт в booking_flow: своей копии проверок здесь быть
+    # не должно, иначе кабинет и админка снова разойдутся в поведении.
+    out = await booking_flow.redeem(parts[1], admin=True)
+    if not out.ok:
+        return await m.answer(f"❌ {out.message}")
+
+    bk = out.booking
+    await m.answer(f"✅ Визит {bk['code']} подтверждён: "
+                   f"{bk['venue_name']}, {bk['when']}.")
     async with Session() as s:
-        b = await s.scalar(select(Booking).where(Booking.code == code))
-        if not b or b.status != "active":
-            return await m.answer("Активная бронь с таким кодом не найдена.")
-        first_time = not await user_visited_venue(s, b.user_id, b.venue_id)
-        b.status = "visited"
-        u, _ = await get_or_create_user(s, b.user_id, "Гость")
-        u.visits += 1
-        pts = PTS_VISIT * (PTS_NEW_MULT if first_time else 1)
-        await add_points(s, u, pts, f"Визит {code}")
-        v = await s.get(Venue, b.venue_id)
-        sl = await s.get(Slot, b.slot_id)
-        await s.commit()
-    await m.answer(f"✅ Визит {code} на {b.visit_date.strftime('%d.%m')} подтверждён. "
-                   f"Гостю начислено {pts} баллов.")
+        booking = await s.get(Booking, bk["id"])
+        guest = await s.get(User, booking.user_id) if booking else None
+    if not guest:
+        return
     try:
         await m.bot.send_message(
-            b.user_id,
-            f"🟢 Визит в <b>{v.name}</b> подтверждён!\n"
-            f"Скидка −{sl.discount}% применена. Начислено ✨ <b>+{pts} баллов</b>"
-            + (" (×2 — новое заведение)" if first_time else "") +
-            f". Баланс: {u.points}.")
+            guest.id,
+            f"🟢 Визит в <b>{bk['venue_name']}</b> подтверждён!\n"
+            f"Скидка −{bk['discount']}% применена. Баланс: {guest.points} баллов.")
     except Exception:
         pass
 

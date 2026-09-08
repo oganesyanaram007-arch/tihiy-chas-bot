@@ -24,7 +24,6 @@ import io
 import random
 from asyncio import Lock
 from collections import OrderedDict, defaultdict
-from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
@@ -43,15 +42,7 @@ from .webauth import _cookie as _web_token_var, _digest as _web_digest
 
 router = APIRouter(prefix="/api/guest", tags=["guest"])
 
-MSK = ZoneInfo("Europe/Moscow")
-
-
-def msk_now() -> dt.datetime:
-    return dt.datetime.now(MSK)
-
-
-def msk_today() -> dt.date:
-    return msk_now().date()
+from .tz import MSK, fmt_slot, msk_now, msk_today  # noqa: E402
 
 
 from .product import DEPOSIT, DEPOSIT_CHARGED, HORIZON_DAYS  # noqa: E402
@@ -236,6 +227,34 @@ async def venue_photo(venue_id: int, w: int = Query(default=0, ge=0, le=2000),
     _cache_put(key, raw, media)
     return Response(content=raw, media_type=media,
                     headers={"Cache-Control": "public, max-age=86400"})
+
+
+@router.get("/bookings/{booking_id}/qr.png")
+async def booking_qr(booking_id: int,
+                     x_init_data: str = Header(default="", alias="X-Init-Data")):
+    """Настоящий QR брони.
+
+    Раньше «QR» в мини-аппе рисовался CSS-градиентом — красивая шахматка,
+    которую нельзя отсканировать ничем. Гость показывал её на входе,
+    и сотруднику она не давала ровным счётом ничего.
+
+    Кодируем сам код брони и ничего больше: сотрудник сканирует его тем же
+    экраном, куда вводит код с голоса, — один путь, а не два.
+    """
+    guest = await current_guest(x_init_data)
+    async with Session() as s:
+        bk = await s.get(Booking, booking_id)
+        if not bk or bk.user_id != guest.id:
+            raise HTTPException(status_code=404, detail="Бронь не найдена")
+        code = bk.code
+    try:
+        import qrcode
+    except ImportError:
+        raise HTTPException(status_code=503, detail="Генератор QR недоступен")
+    buf = io.BytesIO()
+    qrcode.make(code, box_size=8, border=2).save(buf, format="PNG")
+    return Response(content=buf.getvalue(), media_type="image/png",
+                    headers={"Cache-Control": "private, max-age=3600"})
 
 
 @router.get("/venues")

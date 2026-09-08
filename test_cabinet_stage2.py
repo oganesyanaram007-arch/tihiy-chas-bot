@@ -75,11 +75,14 @@ async def run():
         print("OK шаг 2: фото загружено и стало обложкой")
 
         # слишком большое фото должно отклоняться
-        huge = base64.b64encode(b"0" * 2_000_000).decode()
+        from app.cabinet import MAX_PHOTO_BYTES
+        huge = base64.b64encode(b"0" * (MAX_PHOTO_BYTES + 1_000)).decode()
         r_huge = c.post(f"/api/cab/venues/{venue_id}/photos",
                         json={"data_url": f"data:image/png;base64,{huge}"}, headers=H)
-        assert r_huge.status_code == 413
-        print("OK: фото больше 1.5 МБ отклоняется (413)")
+        assert r_huge.status_code == 413, r_huge.status_code
+        limit_mb = MAX_PHOTO_BYTES // 1_000_000
+        assert f"{limit_mb} МБ" in r_huge.json()["detail"], r_huge.json()
+        print(f"OK: фото больше {limit_mb} МБ отклоняется (413), и текст называет тот же предел")
 
         # --- Шаг 3: тихие часы (будни, три окна) ---
         r = c.put(f"/api/cab/venues/{venue_id}/quiet-hours", json={

@@ -55,7 +55,14 @@ async def run():
     await gh.venue_card(cq4, VenueCB(venue_id=v.id, dist="vasil", cat="beauty", day=2))
     text4 = cq4.message.edit_text.call_args[0][0]
     assert v.name in text4
-    assert "99" in text4, "депозит в карточке должен быть 99 ₽"
+    # Состояние оплаты одно на весь продукт и приходит из product.py.
+    # Пока приём оплаты не подключён, карточка не должна обещать депозит.
+    from app.product import DEPOSIT, DEPOSIT_CHARGED
+    if DEPOSIT_CHARGED:
+        assert str(DEPOSIT) in text4, "карточка должна называть цену брони"
+    else:
+        assert "бесплатн" in text4.lower(), f"бронь бесплатна, а карточка говорит: {text4}"
+        assert "депозит" not in text4.lower(), "депозита быть не должно, пока оплата не подключена"
     print(f"OK шаг 4: карточка «{v.name}» открыта, депозит 99 ₽ на месте")
 
     # 5) бронируем слот именно на день+2 (а не на сегодня)
@@ -69,7 +76,13 @@ async def run():
     caption = cq5.message.answer_photo.call_args[1]["caption"]
     expected_date = date_for(2).strftime("%d.%m")
     assert expected_date in caption, f"в подтверждении должна быть дата {expected_date}: {caption}"
-    assert "закрепят столик" in caption, "должна быть новая формулировка про закрепление столика"
+    # Механика погашения одна на весь продукт: код гость называет вслух,
+    # QR только ускоряет. Подтверждение не должно звать показывать QR как
+    # единственный способ — иначе гость с севшим телефоном встанет у входа.
+    low = caption.lower()
+    assert "назовите этот код" in low, f"подтверждение должно вести кодом: {caption}"
+    assert "покажите qr" not in low.replace("если так быстрее, покажите qr", ""), \
+        f"QR не должен подаваться как основной путь: {caption}"
     print(f"OK шаг 5: бронь создана на {expected_date}, QR отправлен, текст обновлён")
 
     # 6) проверяем "Мои брони" — дата отображается, не просто "сегодня"
