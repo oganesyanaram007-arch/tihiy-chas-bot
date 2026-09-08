@@ -18,6 +18,7 @@ from aiogram.types import (BufferedInputFile, CallbackQuery,
 from sqlalchemy import select
 
 from ..config import CANCEL_FREE_HOURS, DEPOSIT, PTS_REF
+from ..product import DEPOSIT_CHARGED, DISCOUNT_MAX, DISCOUNT_MIN, DISTRICTS
 from ..db import (Booking, Session, Slot, Venue, add_points,
                   get_or_create_user, venue_weekdays)
 from ..keyboards import (CAT_ICON, CAT_NAME, DAY_BUTTONS, DIST_NAME, BookCB,
@@ -28,20 +29,28 @@ from ..keyboards import (CAT_ICON, CAT_NAME, DAY_BUTTONS, DIST_NAME, BookCB,
 router = Router()
 
 WELCOME = ("<b>Тихий Час</b> — лучшее в городе, в его тихие часы. 🕑\n\n"
-           "Рестораны, кофейни и салоны снижают цены на 25–50%, "
+           f"Рестораны, кофейни и салоны снижают цены на {DISCOUNT_MIN}–{DISCOUNT_MAX}%, "
            "когда у них свободно. Выбирайте район, день и окно — "
            "и приходите за скидкой на весь счёт.\n\n"
-           "Пилот идёт по Санкт-Петербургу, 15 районов.")
+           f"Пилот идёт по Санкт-Петербургу, {DISTRICTS} районов.")
+
+# Второй шаг зависит от того, подключён ли приём оплаты. Состояние одно
+# на весь продукт и приходит из product.py — своих формулировок тут нет.
+_STEP2 = (f"2️⃣ Забронируйте. Бронь стоит {DEPOSIT} ₽ — это комиссия сервиса, "
+          f"и заведение скинет ровно столько же с вашего счёта.\n"
+          if DEPOSIT_CHARGED else
+          "2️⃣ Забронируйте — это бесплатно. В заведении платите как обычно, "
+          "со скидкой тихого часа.\n")
 
 HOW = ("<b>Как это работает</b>\n\n"
-       "1️⃣ Выберите день, район и час — когда заведение даёт скидку 25–50%.\n"
-       f"2️⃣ Забронируйте. Депозит {DEPOSIT} ₽ целиком зачитывается в счёт "
-       "(на пилоте бронь бесплатная — платежи включим после старта).\n"
-       "3️⃣ При входе покажите QR-код — за вами закрепят столик и отметят "
-       "визит в системе. Скидка считается от той же цены, что действует "
+       f"1️⃣ Выберите день, район и час — когда заведение даёт скидку "
+       f"{DISCOUNT_MIN}–{DISCOUNT_MAX}%.\n"
+       + _STEP2 +
+       "3️⃣ При входе назовите код брони — сотрудник введёт его у себя "
+       "и отметит визит. QR из «Моих броней» можно показать вместо этого, "
+       "если так быстрее. Скидка считается от той же цены, что действует "
        "для всех остальных гостей — отдельного завышенного прайса нет.\n\n"
-       f"Отмена более чем за {CANCEL_FREE_HOURS} часа — свободная.\n"
-       f"За каждый визит начисляем баллы: {DEPOSIT} баллов = бесплатная бронь.")
+       f"Отмена более чем за {CANCEL_FREE_HOURS} часа — свободная.")
 
 
 def qr_png(text: str) -> BufferedInputFile:
@@ -186,10 +195,10 @@ def _venue_text(v: Venue, day: int, has_slots: bool) -> str:
             f"{v.check_note} · <i>{v.left_note}</i>\n\n")
     if not has_slots:
         return base + f"На «{when}» у заведения нет тихих часов — выберите другой день."
+    price = (f"Бронь — {DEPOSIT} ₽, заведение скинет столько же со счёта."
+             if DEPOSIT_CHARGED else "Бронь бесплатна.")
     return (base + f"<b>Тихие окна · {when}</b> — скидка на весь счёт.\n"
-                   f"Скидка считается от текущей цены, без завышения.\n"
-                   f"Депозит {DEPOSIT} ₽ зачитывается в счёт "
-                   f"(на пилоте бронь бесплатная).")
+                   f"Скидка считается от текущей цены, без завышения.\n" + price)
 
 
 @router.callback_query(VenueCB.filter())
@@ -246,9 +255,9 @@ async def book(c: CallbackQuery, callback_data: BookCB):
                f"🕑 {when} ({date_str}), {slot.hour}:00–{slot.hour+1}:00\n"
                f"🏷 Скидка −{slot.discount}% на весь счёт\n"
                f"Код брони: <b>{code}</b>\n\n"
-               f"При входе покажите этот QR — за вами закрепят столик и "
-               f"отметят визит в системе. Заказывайте и отдыхайте со скидкой, "
-               f"платите как обычно, только меньше.\n\n"
+               f"При входе назовите этот код сотруднику — он отметит визит. "
+               f"Если так быстрее, покажите QR выше: сотрудник считает его "
+               f"камерой, и код подставится сам.\n\n"
                f"Отмена — в «Мои брони» (бесплатно за {CANCEL_FREE_HOURS}+ часа).")
     await c.message.answer_photo(qr_png(f"TIHIYCHAS|{code}"), caption=caption,
                                  reply_markup=kb_back())
@@ -292,9 +301,12 @@ async def cancel_booking(c: CallbackQuery, callback_data: CancelCB):
         await s.commit()
     visit_dt = dt.datetime.combine(b.visit_date, dt.time(hour=sl.hour))
     hours_left = (visit_dt - dt.datetime.now()).total_seconds() / 3600
-    note = ("Депозит вернулся бы автоматически."
-            if hours_left >= CANCEL_FREE_HOURS else
-            f"До визита меньше {CANCEL_FREE_HOURS} ч — на проде депозит был бы удержан 50/50.")
+    if not DEPOSIT_CHARGED:
+        note = "Ничего не списывалось — возвращать нечего."
+    elif hours_left >= CANCEL_FREE_HOURS:
+        note = "Деньги за бронь вернутся автоматически."
+    else:
+        note = f"До визита меньше {CANCEL_FREE_HOURS} ч — деньги за бронь удерживаются."
     await c.answer("Бронь отменена")
     await c.message.edit_text(f"Бронь <b>{b.code}</b> отменена. {note}",
                               reply_markup=kb_back())

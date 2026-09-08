@@ -54,8 +54,7 @@ def msk_today() -> dt.date:
     return msk_now().date()
 
 
-DEPOSIT = 99            # единая ставка, решение зафиксировано
-HORIZON_DAYS = 14       # горизонт бронирования
+from .product import DEPOSIT, DEPOSIT_CHARGED, HORIZON_DAYS  # noqa: E402
 DEFAULT_CAPACITY = 4    # если партнёр не задал лимит мест в тихом окне
 POINTS_PER_BOOKING = 20 # начисление за визит происходит в боте, здесь — за бронь
 

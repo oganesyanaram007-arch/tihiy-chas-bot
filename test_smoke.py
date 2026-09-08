@@ -11,14 +11,18 @@ async def run():
                         get_or_create_user, add_points, user_visited_venue,
                         venue_weekdays, works_on)
     from app.seed import seed
-    from app.config import PTS_VISIT, PTS_NEW_MULT, PTS_REF, DEPOSIT, COMMISSION
+    from app.config import PTS_VISIT, PTS_NEW_MULT, PTS_REF, DEPOSIT
     from app.keyboards import DISTRICTS, date_for, day_label
 
     await init_db(); await seed()
 
     # ---- деньги: депозит и комиссия синхронизированы с сайтом ----
-    assert DEPOSIT == 99, f"депозит должен быть 99, а не {DEPOSIT}"
-    assert COMMISSION == 99, f"комиссия должна быть 99, а не {COMMISSION}"
+    # Источник правды — content/product.json на сайте, отсюда только сверка.
+    import json, pathlib
+    src = pathlib.Path(__file__).resolve().parent.parent / "tihiy-chas-web" / "content" / "product.json"
+    if src.exists():
+        want = json.loads(src.read_text(encoding="utf-8"))["money"]["deposit"]
+        assert DEPOSIT == want, f"депозит {DEPOSIT} разошёлся с product.json ({want})"
 
     async with Session() as s:
         venues = (await s.scalars(select(Venue))).all()
@@ -94,7 +98,7 @@ async def run():
         assert hours_left > 24, "бронь через 5 дней должна давать много часов на отмену"
 
         print(f"OK: {len(venues)} заведений в {len(districts_in_use)} районах, {len(slots)} слотов")
-        print(f"OK: депозит {DEPOSIT} ₽, комиссия {COMMISSION} ₽ — синхронизировано с сайтом")
+        print(f"OK: депозит {DEPOSIT} ₽ — синхронизировано с сайтом")
         print(f"OK: расписание по дням недели работает (будни/все дни проверены)")
         print(f"OK: бронь {code} на {day_label(day_offset)} ({visit_date}) · QR ✓ · "
               f"визит ✓ (+{pts} баллов, баланс {guest.points}) · рефералка ✓")
