@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import secrets
 import time
 from collections import defaultdict
 
 from sqlalchemy import select, update
 
 from .db import Booking, BookingEvent, Session, Slot, User, Venue, add_points
+from .product import CODE_ALPHABET, CODE_LEGACY_PREFIX, CODE_LENGTH
 from .models_partner import AuditLog, PartnerUser, VenueProfile
 from .tz import fmt_dt, fmt_slot, msk_now, slot_start_msk, utc_now
 
@@ -59,18 +61,69 @@ def _fail(reason: str, message: str, http: int = 409, booking=None) -> Outcome:
     return Outcome(ok=False, reason=reason, message=message, http=http, booking=booking)
 
 
-def normalize_code(raw: str) -> str:
-    """Приводит введённый код к каноническому виду.
+# Буквы, которые в кириллице и латинице выглядят одинаково. Сотрудник
+# набирает код на телефоне и раскладку переключить забывает — отказывать
+# из-за этого нельзя, гость назвал код правильно.
+_LAT_TO_CYR = {"A": "А", "B": "В", "E": "Е", "K": "К", "M": "М", "H": "Н",
+               "O": "О", "P": "Р", "C": "С", "T": "Т", "X": "Х", "Y": "У"}
+_CYR_TO_LAT = {v: k for k, v in _LAT_TO_CYR.items()}
 
-    Сотрудник вводит код с телефона в спешке: с пробелами, в нижнем
-    регистре, иногда с латинской раскладки вместо кириллицы (или наоборот).
-    Отказывать из-за раскладки нельзя — гость назвал код правильно.
+
+def _clean(raw: str) -> str:
+    """Убирает всё, чем код обрастает при наборе: пробелы, тире, регистр."""
+    s = (raw or "").strip().upper()
+    for junk in (" ", "\t", "\u00a0", "—", "–", "−"):
+        s = s.replace(junk, "-" if junk in ("—", "–", "−") else "")
+    return s
+
+
+def code_candidates(raw: str) -> list[str]:
+    """Варианты, которыми мог быть набран один и тот же код.
+
+    Форматов два и оба живые: новый — шесть латинских знаков, старый —
+    ТЧ- и четыре цифры с кириллическим префиксом. Одно правило замены их
+    не покрывает: перевод латиницы в кириллицу чинит старый код, набранный
+    не в той раскладке, и ломает новый. Поэтому пробуем оба направления,
+    а решает уже поиск в базе.
     """
-    s = (raw or "").strip().upper().replace(" ", "").replace("—", "-").replace("–", "-")
-    # Кириллица ↔ латиница для букв, которые выглядят одинаково.
-    same = {"A": "А", "B": "В", "E": "Е", "K": "К", "M": "М", "H": "Н",
-            "O": "О", "P": "Р", "C": "С", "T": "Т", "X": "Х", "Y": "У"}
-    return "".join(same.get(ch, ch) for ch in s)
+    s = _clean(raw)
+    if not s:
+        return []
+    out = [s]
+    for mapping in (_CYR_TO_LAT, _LAT_TO_CYR):
+        variant = "".join(mapping.get(ch, ch) for ch in s)
+        if variant not in out:
+            out.append(variant)
+    # Гость иногда диктует код без префикса, а сотрудник так и вводит.
+    if CODE_LEGACY_PREFIX and s.isdigit():
+        for pref in (CODE_LEGACY_PREFIX, "".join(_CYR_TO_LAT.get(c, c)
+                                                 for c in CODE_LEGACY_PREFIX)):
+            if pref + s not in out:
+                out.append(pref + s)
+    return out
+
+
+def normalize_code(raw: str) -> str:
+    """Канонический вид кода — первый из вариантов. Нужен для показа в ответах."""
+    got = code_candidates(raw)
+    return got[0] if got else ""
+
+
+async def new_code(s) -> str:
+    """Свежий код брони.
+
+    secrets, а не random: коды не должны идти подряд и не должны угадываться
+    по своему. Алфавит без похожих знаков (0/O, 1/I/L, U) лежит в
+    content/product.json — гость называет код вслух, а сотрудник набирает
+    его на телефоне, и пара «ноль или буква О» стоит отказа на входе.
+    """
+    for _ in range(12):
+        code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LENGTH))
+        taken = await s.scalar(select(Booking.id).where(Booking.code == code))
+        if not taken:
+            return code
+    # 30^6 вариантов: сюда можно попасть только при сломанном генераторе.
+    raise RuntimeError("не удалось выдать уникальный код брони")
 
 
 def attempts_left(partner_user_id: int) -> int:
@@ -147,14 +200,16 @@ async def redeem(code: str, *, partner_id: int | None = None,
                          "отметьте гостя в списке броней или позовите управляющего.",
                          http=429)
 
-    wanted = normalize_code(code) if code else ""
+    wanted = code_candidates(code) if code else []
 
     async with Session() as s:
         # ---- находим бронь ----
         if booking_id is not None:
             bk = await s.get(Booking, booking_id)
+        elif wanted:
+            bk = await s.scalar(select(Booking).where(Booking.code.in_(wanted)))
         else:
-            bk = await s.scalar(select(Booking).where(Booking.code == wanted))
+            bk = None
 
         venue_ids: list[int] = []
         if partner_id is not None:

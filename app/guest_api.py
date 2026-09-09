@@ -21,7 +21,6 @@ import base64
 import datetime as dt
 import html
 import io
-import random
 from asyncio import Lock
 from collections import OrderedDict, defaultdict
 
@@ -352,10 +351,6 @@ class BookIn(BaseModel):
     pay_with_points: bool = False
 
 
-def _new_code() -> str:
-    return "ТЧ-" + str(random.randint(1000, 9999))
-
-
 @router.post("/bookings")
 async def create_booking(body: BookIn,
                          x_init_data: str = Header(default="", alias="X-Init-Data")):
@@ -412,13 +407,7 @@ async def create_booking(body: BookIn,
                     raise HTTPException(status_code=402, detail="Недостаточно баллов")
                 await add_points(s, user, -DEPOSIT, "deposit_points")
 
-            for _ in range(6):
-                code = _new_code()
-                exists = await s.scalar(select(func.count(Booking.id)).where(Booking.code == code))
-                if not exists:
-                    break
-            else:
-                raise HTTPException(status_code=500, detail="Не удалось выдать код брони")
+            code = await booking_flow.new_code(s)
 
             bk = Booking(code=code, user_id=user.id, venue_id=venue_id,
                          slot_id=slot_id, visit_date=day, status="active")

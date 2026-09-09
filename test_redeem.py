@@ -197,7 +197,67 @@ async def run():
     assert r.status_code == 404, r.status_code
     OK("404 на чужую бронь")
 
+    await run_codes(D, c, msk_today, select)
+
     print("\nВСЁ ПРОШЛО")
+
+
+async def run_codes(D, c, msk_today, select):
+    """Формат кода: длина, алфавит, случайность, уникальность, оба поколения."""
+    from app import booking_flow as bf
+    from app.db import Booking, Session
+    from app.product import CODE_ALPHABET, CODE_LENGTH
+
+    print("\n13. Длина и алфавит")
+    async with Session() as s:
+        codes = [await bf.new_code(s) for _ in range(300)]
+    assert all(len(c) == CODE_LENGTH for c in codes), "разная длина"
+    bad = {ch for c in codes for ch in c} - set(CODE_ALPHABET)
+    assert not bad, f"символы вне алфавита: {bad}"
+    for ch in "01OIL":
+        assert ch not in CODE_ALPHABET, f"похожий знак {ch} остался в алфавите"
+    OK(f"{CODE_LENGTH} знаков из {len(CODE_ALPHABET)}, без 0/O/1/I/L")
+
+    print("\n14. Коды не подряд и не повторяются")
+    assert len(set(codes)) == len(codes), "генератор выдал дубль"
+    # Соседние коды не должны отличаться на единицу ни в одном разряде:
+    # так ловится счётчик, замаскированный под случайность.
+    idx = [[CODE_ALPHABET.index(ch) for ch in c] for c in codes]
+    seq = sum(1 for a, b in zip(idx, idx[1:])
+              if sum(1 for x, y in zip(a, b) if x != y) <= 1)
+    assert seq < 5, f"{seq} пар отличаются одним знаком — похоже на счётчик"
+    OK(f"300 кодов, все разные, последовательности нет")
+
+    print("\n15. Занятый код не выдаётся повторно")
+    async with Session() as s:
+        taken = await s.scalar(select(Booking.code).limit(1))
+        fresh = [await bf.new_code(s) for _ in range(50)]
+    assert taken not in fresh, "выдал уже занятый код"
+    OK(f"занятый {taken} не переиспользован")
+
+    print("\n16. Разбор ввода понимает оба поколения")
+    assert "4KMPQ7" in bf.code_candidates(" 4kmpq7 ")
+    assert "ТЧ-1234" in bf.code_candidates("тч-1234")
+    assert "ТЧ-1234" in bf.code_candidates("1234"), "старый код без префикса"
+    # Кириллическая раскладка на новом коде не должна ломать разбор.
+    assert "4KMPQ7" in bf.code_candidates("4КМРQ7")
+    OK("новый код, старый код и старый код без префикса — все находятся")
+
+    print("\n17. Погашение по коду нового формата")
+    async with Session() as s:
+        code = await bf.new_code(s)
+        bk = await s.get(Booking, D["b"]["booking"])
+        bk.code = code
+        bk.status = "active"
+        bk.visit_date = msk_today()
+        await s.commit()
+    bf.reset_attempts(D["b"]["pu"])
+    r = c.post("/api/cab/bookings/redeem", json={"code": code.lower()},
+               headers={"Cookie": f"tc_cab={D['b']['token']}"})
+    assert r.status_code == 200, r.text
+    OK(f"код {code} погашен, введённый в нижнем регистре")
+
+    print("\nФОРМАТ КОДА: ВСЁ ПРОШЛО")
 
 
 asyncio.run(run())

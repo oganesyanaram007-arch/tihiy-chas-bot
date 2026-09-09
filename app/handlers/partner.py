@@ -18,6 +18,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton as B, InlineKeyboa
 from sqlalchemy import delete, select
 
 from ..config import ADMIN_IDS, PTS_NEW_MULT, PTS_VISIT
+from ..product import CODE_LENGTH
 from .. import booking_flow
 from ..db import (Booking, PartnerLead, Session, Slot, User, Venue, add_points,
                   get_or_create_user, user_visited_venue)
@@ -103,7 +104,8 @@ async def confirm_visit(m: Message):
         return
     parts = m.text.split(maxsplit=1)
     if len(parts) < 2:
-        return await m.answer("Формат: /visit ТЧ-1234")
+        return await m.answer(f"Формат: /visit КОД (например, "
+                              f"/visit {'X' * CODE_LENGTH})")
     # Сам переход живёт в booking_flow: своей копии проверок здесь быть
     # не должно, иначе кабинет и админка снова разойдутся в поведении.
     out = await booking_flow.redeem(parts[1], admin=True)

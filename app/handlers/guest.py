@@ -8,7 +8,6 @@
 from __future__ import annotations
 import datetime as dt
 import io
-import random
 
 import qrcode
 from aiogram import F, Router
@@ -245,7 +244,9 @@ async def book(c: CallbackQuery, callback_data: BookCB):
         v = await s.get(Venue, slot.venue_id)
         u, _ = await get_or_create_user(s, c.from_user.id,
                                         c.from_user.first_name or "Гость")
-        code = f"ТЧ-{random.randint(1000, 9999)}"
+        # Тот же генератор, что и в вебе: раньше бот выдавал random без
+        # проверки уникальности — при совпадении бронь падала с 500.
+        code = await booking_flow.new_code(s)
         visit_date = date_for(callback_data.day)
         s.add(Booking(code=code, user_id=u.id, venue_id=v.id, slot_id=slot.id,
                       visit_date=visit_date))
