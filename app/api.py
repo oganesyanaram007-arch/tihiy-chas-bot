@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import html
 import os
 import re
@@ -34,13 +35,26 @@ ALLOWED = [o for o in os.getenv(
     "https://tihiychas.ru,https://www.tihiychas.ru"
 ).split(",") if o]
 
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await init_db()
-    yield
+    # Воркер уведомлений живёт рядом с API. Он же поднимается в процессе
+    # бота — порция забирается атомарным UPDATE, поэтому два воркера
+    # не отправят одно сообщение дважды.
+    from . import notify
+    await notify.requeue_stuck()
+    stop = asyncio.Event()
+    task = asyncio.create_task(notify.worker(stop))
+    try:
+        yield
+    finally:
+        stop.set()
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
 
 api = FastAPI(title="Тихий Час — API", docs_url=None, redoc_url=None,

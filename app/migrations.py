@@ -125,9 +125,40 @@ async def _m0002_booking_events(conn) -> None:
     await create_index(conn, "ix_booking_events_created", "booking_events", "created_at")
 
 
+async def _m0003_notifications(conn) -> None:
+    """Очередь уведомлений.
+
+    Раньше сообщение в Telegram отправлялось прямо из обработчика запроса:
+    гость ждал ответа, пока мы стучались в Telegram, а ошибки глушились
+    голым except. Залипший Telegram означал зависшую бронь, а недоставленное
+    уведомление исчезало бесследно.
+
+    Теперь запись кладётся в очередь в той же транзакции, что и бронь,
+    а отправляет её отдельный воркер с нарастающими паузами между попытками.
+    """
+    await create_table(conn, "notifications", """
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind VARCHAR(32) NOT NULL,
+        chat_id BIGINT NOT NULL,
+        text TEXT NOT NULL,
+        parse_mode VARCHAR(16) DEFAULT 'HTML',
+        status VARCHAR(16) NOT NULL DEFAULT 'pending',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at DATETIME,
+        last_error VARCHAR(300) DEFAULT '',
+        booking_id INTEGER,
+        created_at DATETIME NOT NULL,
+        sent_at DATETIME
+    """)
+    # Воркер выбирает ровно по этой паре: что готово к отправке прямо сейчас.
+    await create_index(conn, "ix_notifications_due", "notifications",
+                       "status, next_attempt_at")
+
+
 MIGRATIONS: list[tuple[str, object]] = [
     ("0001_booking_redemption", _m0001_booking_redemption),
     ("0002_booking_events", _m0002_booking_events),
+    ("0003_notifications", _m0003_notifications),
 ]
 
 

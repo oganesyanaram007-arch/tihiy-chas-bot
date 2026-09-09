@@ -13,6 +13,7 @@ import base64
 import contextvars
 import datetime as dt
 import hashlib
+import html
 import os
 import secrets
 
@@ -20,10 +21,12 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, select
 
-from . import booking_flow
+from . import booking_flow, notify
+from .tz import fmt_dt, fmt_slot, msk_today
 from .auth import AuthError, verify_init_data
 from .config import ADMIN_IDS, BOT_TOKEN
-from .db import Booking, Session, Slot, User, Venue, WebSession, add_points
+from .db import (Booking, Notification, Session, Slot, User, Venue,
+                 WebSession, add_points)
 from .models_partner import (AuditLog, CabLogin, CabSession, Partner,
                              PartnerUser, QuietWindow, StaffInvite,
                              VenuePhoto, VenueProfile)
@@ -626,38 +629,36 @@ async def submit_venue(venue_id: int,
             ctx["partner"].status = "moderation"
         s.add(AuditLog(partner_user_id=ctx["user"].id, partner_id=ctx["partner"].id,
                        action="venue_submitted", entity="venue", entity_id=venue_id))
+        # В той же транзакции: заявка и уведомление о ней либо есть оба,
+        # либо нет обоих.
+        await _queue_admin_submission(s, venue_id, v.name, p.district,
+                                      ctx["partner"].id)
         await s.commit()
-        venue_name, district = v.name, p.district
-        partner_id = ctx["partner"].id
 
-    await _notify_admins_new_submission(venue_id, venue_name, district, partner_id)
     return {"ok": True, "status": "moderation"}
 
 
-async def _notify_admins_new_submission(venue_id: int, name: str, district: str,
-                                        partner_id: int) -> None:
-    """Шлёт админам карточку на модерацию с кнопками прямо в Telegram —
-    решение принимается в один тап, без захода в отдельную панель."""
-    if not (BOT_TOKEN and ADMIN_IDS):
-        return
-    from aiogram import Bot
-    from aiogram.client.default import DefaultBotProperties
-    from aiogram.enums import ParseMode
-    from .keyboards import DIST_NAME
-    from .handlers.partner import kb_moderation as _kb_mod
+async def _queue_admin_submission(s, venue_id: int, name: str, district: str,
+                                  partner_id: int) -> None:
+    """Поставить админам уведомление о заявке на модерацию.
 
-    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    В очередь, а не напрямую: раньше отправка держала ответ партнёру,
+    а сбой Telegram глушился и заявка молча оставалась незамеченной.
+
+    Кнопки «Одобрить/Отклонить» из очереди не уходят — она отправляет
+    только текст. Решение принимается командой /venue_<id>, а очередь
+    команд не теряет: заявку видно в /pending в любом случае.
+    """
+    if not ADMIN_IDS:
+        return
+    from .keyboards import DIST_NAME
     text = (f"🆕 <b>Новое заведение на модерации</b>\n\n"
-           f"<b>{name}</b>\nРайон: {DIST_NAME.get(district, district)}\n"
-           f"Партнёр #{partner_id} · Заведение #{venue_id}\n\n"
-           f"Проверьте адрес, фото и часы перед публикацией — "
-           f"/venue_{venue_id} покажет карточку целиком.")
-    for admin in ADMIN_IDS:
-        try:
-            await bot.send_message(admin, text, reply_markup=_kb_mod(venue_id))
-        except Exception:
-            pass
-    await bot.session.close()
+            f"<b>{html.escape(name)}</b>\n"
+            f"Район: {DIST_NAME.get(district, district)}\n"
+            f"Партнёр #{partner_id} · Заведение #{venue_id}\n\n"
+            f"Проверьте адрес, фото и часы перед публикацией — "
+            f"/venue_{venue_id} покажет карточку целиком.")
+    await notify.enqueue_many(s, "admin_venue_submitted", ADMIN_IDS, text)
 
 # ---------------------------------------------------------------------
 # PARTNER_BOOKINGS: брони по заведениям партнёра.
@@ -669,7 +670,10 @@ async def _notify_admins_new_submission(venue_id: int, name: str, district: str,
 async def partner_bookings(ctx=Depends(current_user)):
     """Все брони заведений партнёра: сначала ближайшие."""
     partner = ctx["partner"]
-    today = dt.date.today()
+    # Московское время, а не серверное: после полуночи по Москве сервер в UTC
+    # считал «сегодня» вчерашним днём, и у гостя с заведением расходились
+    # и дата брони, и признак «предстоит».
+    today = msk_today()
     async with Session() as s:
         venue_ids = list(await s.scalars(
             select(VenueProfile.venue_id).where(VenueProfile.partner_id == partner.id)))
@@ -702,6 +706,60 @@ def _actor(request: Request) -> dict:
         "ip": (request.headers.get("x-forwarded-for", "").split(",")[0].strip()
                or (request.client.host if request.client else "")),
         "device": request.headers.get("user-agent", ""),
+    }
+
+
+@router.get("/bookings/today")
+async def bookings_today(ctx=Depends(current_user)):
+    """Экран смены: кто придёт сегодня, с кодами и временем.
+
+    Это источник правды для персонала — не уведомление в Telegram.
+    Сообщение может не дойти, партнёр может заблокировать бота, телефон
+    может быть не тот. Этот экран не зависит ни от чего из перечисленного.
+
+    Отдельно от /bookings: тот отдаёт двести записей за все даты, а хостес
+    у входа нужны только сегодняшние и в порядке времени.
+    """
+    partner = ctx["partner"]
+    day = msk_today()
+    async with Session() as s:
+        venue_ids = list(await s.scalars(
+            select(VenueProfile.venue_id).where(VenueProfile.partner_id == partner.id)))
+        if not venue_ids:
+            return {"date": day.isoformat(), "bookings": [],
+                    "waiting": 0, "arrived": 0, "notifications_blocked": False}
+        rows = (await s.execute(
+            select(Booking, Venue, Slot, User)
+            .join(Venue, Venue.id == Booking.venue_id)
+            .join(Slot, Slot.id == Booking.slot_id)
+            .join(User, User.id == Booking.user_id)
+            .where(Booking.venue_id.in_(venue_ids), Booking.visit_date == day)
+            .order_by(Slot.hour, Booking.id))).all()
+
+        # Заблокировал ли кто-то из сотрудников бота: иначе непонятно,
+        # почему уведомления «не приходят», и люди винят сервис.
+        staff_ids = list(await s.scalars(
+            select(PartnerUser.tg_id).where(PartnerUser.partner_id == partner.id)))
+        blocked = False
+        if staff_ids:
+            blocked = bool(await s.scalar(
+                select(Notification.id).where(Notification.chat_id.in_(staff_ids),
+                                              Notification.status == "blocked").limit(1)))
+
+    items = [{
+        "id": b.id, "code": b.code, "status": b.status,
+        "hour": sl.hour, "when": fmt_slot(b.visit_date, sl.hour),
+        "discount": sl.discount,
+        "venue_id": v.id, "venue_name": v.name,
+        "guest_name": u.name, "guest_phone": u.phone or "",
+        "redeemed_at": fmt_dt(b.redeemed_at) if b.redeemed_at else None,
+    } for b, v, sl, u in rows]
+    return {
+        "date": day.isoformat(),
+        "bookings": items,
+        "waiting": sum(1 for i in items if i["status"] == "active"),
+        "arrived": sum(1 for i in items if i["status"] == "visited"),
+        "notifications_blocked": blocked,
     }
 
 

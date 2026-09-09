@@ -24,9 +24,6 @@ import io
 from asyncio import Lock
 from collections import OrderedDict, defaultdict
 
-from aiogram import Bot
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
@@ -35,14 +32,15 @@ from sqlalchemy import func, select
 from . import booking_flow
 from .auth import AuthError, verify_init_data
 from .config import ADMIN_IDS, BOT_TOKEN
-from .db import (Booking, PointsLedger, Session, Slot, User, Venue, WebSession,
-                 add_points, get_or_create_user, works_on)
+from . import notify
+from .db import (Booking, BookingEvent, PointsLedger, Session, Slot, User,
+                 Venue, WebSession, add_points, get_or_create_user, works_on)
 from .models_partner import PartnerUser, VenueProfile, QuietWindow, VenuePhoto
 from .webauth import _cookie as _web_token_var, _digest as _web_digest
 
 router = APIRouter(prefix="/api/guest", tags=["guest"])
 
-from .tz import MSK, fmt_slot, msk_now, msk_today  # noqa: E402
+from .tz import MSK, fmt_slot, msk_now, msk_today, utc_now  # noqa: E402
 
 
 from .product import DEPOSIT, DEPOSIT_CHARGED, HORIZON_DAYS  # noqa: E402
@@ -412,11 +410,17 @@ async def create_booking(body: BookIn,
             bk = Booking(code=code, user_id=user.id, venue_id=venue_id,
                          slot_id=slot_id, visit_date=day, status="active")
             s.add(bk)
+            await s.flush()                 # нужен id брони для очереди и журнала
             await add_points(s, user, POINTS_PER_BOOKING, "booking")
+            s.add(BookingEvent(booking_id=bk.id, action="create",
+                               status_from="", status_to="active",
+                               actor_kind="guest", actor_id=user.id,
+                               actor_name=user.name or "", note=code,
+                               created_at=utc_now()))
+            await _queue_partner_note(s, bk.id, venue_id, venue_name, body.hour,
+                                      slot_disc, day, code, guest.name)
             await s.commit()
             bk_id, points = bk.id, user.points
-
-    await _notify_partner(venue_id, venue_name, body.hour, slot_disc, day, code, guest.name)
     return {"ok": True, "id": bk_id, "code": code, "discount": slot_disc,
             "points": points, "deposit": DEPOSIT}
 
@@ -469,20 +473,25 @@ async def cancel_booking(body: CancelIn, request: Request,
     return {"ok": True}
 
 
-async def _notify_partner(venue_id: int, venue_name: str, hour: int, discount: int,
-                          day: dt.date, code: str, guest_name: str) -> None:
-    """Заведение должно узнать о госте — иначе бронь бессмысленна."""
-    if not BOT_TOKEN:
-        return
-    async with Session() as s:
-        prof = await s.scalar(select(VenueProfile).where(VenueProfile.venue_id == venue_id))
-        targets: list[int] = []
-        if prof:
-            targets = list(await s.scalars(
-                select(PartnerUser.tg_id).where(
-                    PartnerUser.partner_id == prof.partner_id,
-                    PartnerUser.active.is_(True))
-            ))
+async def _queue_partner_note(s, booking_id: int, venue_id: int, venue_name: str,
+                              hour: int, discount: int, day: dt.date,
+                              code: str, guest_name: str) -> None:
+    """Поставить заведению уведомление о госте.
+
+    Кладём в очередь в той же транзакции, что и бронь: иначе бывает
+    «бронь есть, уведомления нет» или наоборот. Отправит воркер.
+
+    Сообщение — не источник правды: если Telegram недоступен или партнёр
+    заблокировал бота, бронь всё равно видна на экране «Брони на сегодня»
+    в кабинете. Именно поэтому недоставка не должна ломать бронирование.
+    """
+    prof = await s.scalar(select(VenueProfile).where(VenueProfile.venue_id == venue_id))
+    targets: list[int] = []
+    if prof:
+        targets = list(await s.scalars(
+            select(PartnerUser.tg_id).where(
+                PartnerUser.partner_id == prof.partner_id,
+                PartnerUser.active.is_(True))))
     if not targets:
         targets = list(ADMIN_IDS)
     if not targets:
@@ -490,14 +499,9 @@ async def _notify_partner(venue_id: int, venue_name: str, hour: int, discount: i
 
     text = (f"📅 <b>Новая бронь</b>\n\n"
             f"<b>{html.escape(venue_name)}</b>\n"
-            f"{day.strftime('%d.%m')} · {hour}:00–{hour + 1}:00 · −{discount}%\n"
+            f"{fmt_slot(day, hour)} · −{discount}%\n"
             f"Гость: {html.escape(guest_name)}\n"
             f"Код: <code>{code}</code>\n\n"
-            f"Подтвердить визит: /visit {code}")
-    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    for tg_id in targets:
-        try:
-            await bot.send_message(tg_id, text)
-        except Exception:
-            pass
-    await bot.session.close()
+            f"Гость назовёт код на входе — отметьте визит в кабинете.")
+    await notify.enqueue_many(s, "partner_new_booking", targets, text,
+                              booking_id=booking_id)

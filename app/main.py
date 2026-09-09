@@ -40,8 +40,19 @@ async def main() -> None:
             menu_button=MenuButtonWebApp(text="Тихий Час",
                                          web_app=WebAppInfo(url=MINIAPP_URL)))
 
+    # Уведомления разбирает фоновый воркер, а не обработчик запроса.
+    # Тот же воркер поднят в процессе API — забор порции атомарный.
+    from .notify import requeue_stuck, worker
+    await requeue_stuck()
+    stop = asyncio.Event()
+    notes = asyncio.create_task(worker(stop))
+
     logging.info("Бот @%s запущен", me.username)
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        stop.set()
+        notes.cancel()
 
 
 if __name__ == "__main__":

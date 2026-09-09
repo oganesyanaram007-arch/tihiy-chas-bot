@@ -4,7 +4,7 @@
 from __future__ import annotations
 import datetime as dt
 from sqlalchemy import (BigInteger, Boolean, Date, DateTime, ForeignKey, Integer,
-                        String, select, func)
+                        String, Text, select, func)
 from sqlalchemy.ext.asyncio import (AsyncSession, async_sessionmaker,
                                     create_async_engine)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -108,6 +108,34 @@ class BookingEvent(Base):
     device: Mapped[str] = mapped_column(String(200), default="")
     note: Mapped[str] = mapped_column(String(300), default="")
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+
+class Notification(Base):
+    """Очередь исходящих сообщений.
+
+    Отправка не должна происходить в обработчике запроса: гость ждал ответа,
+    пока мы стучались в Telegram, а ошибки глушились голым except. Запись
+    кладётся сюда в той же транзакции, что и бронь, — если Telegram лежит,
+    бронь всё равно создана, а сообщение уйдёт позже.
+
+    status: pending → sent | blocked | failed
+      blocked — партнёр запретил боту писать. Повторять бессмысленно,
+      и это отдельное состояние: его видно в кабинете и по нему понятно,
+      почему человек «ничего не получал».
+    """
+    __tablename__ = "notifications"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    kind: Mapped[str] = mapped_column(String(32))
+    chat_id: Mapped[int] = mapped_column(BigInteger)
+    text: Mapped[str] = mapped_column(Text)
+    parse_mode: Mapped[str] = mapped_column(String(16), default="HTML")
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str] = mapped_column(String(300), default="")
+    booking_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+    sent_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class PartnerLead(Base):
