@@ -121,7 +121,7 @@ async def _feed(dist: str, cat: str, day: int):
             q_slots = select(Slot).where(Slot.venue_id == v.id)
             # сегодня прошедшие часы не предлагаем — как на сайте
             if day == 0:
-                q_slots = q_slots.where(Slot.hour > dt.datetime.now().hour)
+                q_slots = q_slots.where(Slot.hour > msk_now().hour)
             slots = (await s.scalars(q_slots.order_by(Slot.discount.desc()))).all()
             if slots:
                 out.append((v, slots[0].discount))
@@ -185,7 +185,7 @@ async def _venue_slots(v: Venue, day: int):
     async with Session() as s:
         q = select(Slot).where(Slot.venue_id == v.id)
         if day == 0:
-            q = q.where(Slot.hour > dt.datetime.now().hour)
+            q = q.where(Slot.hour > msk_now().hour)
         return (await s.scalars(q.order_by(Slot.hour))).all()
 
 

@@ -442,6 +442,9 @@ async def my_bookings(x_init_data: str = Header(default="", alias="X-Init-Data")
     items = [{
         "id": b.id, "code": b.code, "status": b.status,
         "date": b.visit_date.isoformat(), "hour": sl.hour, "discount": sl.discount,
+        # Готовая строка времени той же утилитой, что у бота и кабинета:
+        # одна бронь обязана читаться одинаково во всех трёх интерфейсах.
+        "when": fmt_slot(b.visit_date, sl.hour),
         "venue": {"id": v.id, "name": v.name, "cat": v.cat, "place": v.place,
                   "district": v.district, "district_name": DIST_NAME.get(v.district, v.district)},
         "upcoming": b.status == "active" and b.visit_date >= today,

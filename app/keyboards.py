@@ -7,6 +7,7 @@ from aiogram.filters.callback_data import CallbackData
 from aiogram.types import (InlineKeyboardButton as B, InlineKeyboardMarkup,
                            WebAppInfo)
 from .config import MINIAPP_URL
+from .tz import msk_today
 
 CATS = [("all", "Все"), ("food", "Еда"), ("coffee", "Кофе"),
         ("beauty", "Красота"), ("spa", "СПА"), ("fun", "Развлечения"),
@@ -32,7 +33,9 @@ WEEKDAYS_SHORT = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 
 
 def date_for(offset: int) -> dt.date:
-    return dt.date.today() + dt.timedelta(days=offset)
+    # Москва, а не время сервера: сервер живёт в UTC, и после полуночи
+    # по Москве «сегодня» у бота расходилось с сайтом на целые сутки.
+    return msk_today() + dt.timedelta(days=offset)
 
 
 def day_label(offset: int) -> str:
