@@ -16,7 +16,7 @@ import hashlib
 import os
 import secrets
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, select
 
@@ -696,6 +696,15 @@ async def partner_bookings(ctx=Depends(current_user)):
     return {"bookings": items, "new_count": new_count}
 
 
+def _actor(request: Request) -> dict:
+    """Откуда пришла отметка — для журнала брони."""
+    return {
+        "ip": (request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+               or (request.client.host if request.client else "")),
+        "device": request.headers.get("user-agent", ""),
+    }
+
+
 class VisitIn(BaseModel):
     booking_id: int
 
@@ -705,7 +714,7 @@ class RedeemIn(BaseModel):
 
 
 @router.post("/bookings/visit")
-async def confirm_visit(body: VisitIn, ctx=Depends(current_user)):
+async def confirm_visit(body: VisitIn, request: Request, ctx=Depends(current_user)):
     """Кнопка «Пришёл» напротив брони в списке.
 
     Окно действия кода тут не проверяем: сотрудник смотрит на конкретную
@@ -716,21 +725,21 @@ async def confirm_visit(body: VisitIn, ctx=Depends(current_user)):
     out = await booking_flow.redeem("", partner_id=ctx["partner"].id,
                                     partner_user_id=ctx["user"].id,
                                     booking_id=body.booking_id,
-                                    enforce_window=False)
+                                    enforce_window=False, **_actor(request))
     if not out.ok:
         raise HTTPException(status_code=out.http, detail=out.message)
     return {"ok": True, "booking": out.booking, "message": out.message}
 
 
 @router.post("/bookings/redeem")
-async def redeem_code(body: RedeemIn, ctx=Depends(current_user)):
+async def redeem_code(body: RedeemIn, request: Request, ctx=Depends(current_user)):
     """Погашение по коду: гость называет его вслух, сотрудник вводит.
 
     Сюда же приходит результат сканирования QR — камера лишь подставляет
     код в то же поле, отдельного пути для QR нет.
     """
     out = await booking_flow.redeem(body.code, partner_id=ctx["partner"].id,
-                                    partner_user_id=ctx["user"].id)
+                                    partner_user_id=ctx["user"].id, **_actor(request))
     if not out.ok:
         raise HTTPException(status_code=out.http, detail=out.message)
     return {"ok": True, "booking": out.booking, "message": out.message}

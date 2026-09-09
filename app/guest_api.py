@@ -28,11 +28,12 @@ from collections import OrderedDict, defaultdict
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from fastapi import APIRouter, Header, HTTPException, Query, Response
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
+from . import booking_flow
 from .auth import AuthError, verify_init_data
 from .config import ADMIN_IDS, BOT_TOKEN
 from .db import (Booking, PointsLedger, Session, Slot, User, Venue, WebSession,
@@ -461,19 +462,21 @@ class CancelIn(BaseModel):
 
 
 @router.post("/bookings/cancel")
-async def cancel_booking(body: CancelIn,
+async def cancel_booking(body: CancelIn, request: Request,
                          x_init_data: str = Header(default="", alias="X-Init-Data")):
     """Отмена. Метод POST, а не DELETE, — CORS в api.py разрешает
-    только GET/POST/OPTIONS, менять его ради одного маршрута не стоит."""
+    только GET/POST/OPTIONS, менять его ради одного маршрута не стоит.
+
+    Сам переход — в booking_flow: своей копии проверок здесь быть не должно.
+    """
     guest = await current_guest(x_init_data)
-    async with Session() as s:
-        bk = await s.get(Booking, body.booking_id)
-        if not bk or bk.user_id != guest.id:
-            raise HTTPException(status_code=404, detail="Бронь не найдена")
-        if bk.status != "active":
-            raise HTTPException(status_code=409, detail="Бронь уже закрыта")
-        bk.status = "cancelled"
-        await s.commit()
+    out = await booking_flow.cancel(
+        body.booking_id, guest_id=guest.id, actor_name=guest.name or "",
+        ip=(request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+            or (request.client.host if request.client else "")),
+        device=request.headers.get("user-agent", ""))
+    if not out.ok:
+        raise HTTPException(status_code=out.http, detail=out.message)
     return {"ok": True}
 
 

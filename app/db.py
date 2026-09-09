@@ -78,6 +78,36 @@ class Booking(Base):
     visit_date: Mapped[dt.date] = mapped_column(Date, default=dt.date.today)  # на какой день бронь
     status: Mapped[str] = mapped_column(String(12), default="active")  # active/cancelled/visited
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+    # Когда и кто отметил визит. Раньше ответ «уже погашен в 15:12, отметила
+    # Марина» собирался из журнала кабинета — колонок просто не было.
+    redeemed_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    redeemed_by: Mapped[int | None] = mapped_column(Integer, nullable=True)  # partner_users.id
+    cancelled_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class BookingEvent(Base):
+    """Журнал жизни брони: append-only, строка на каждый переход.
+
+    Таблица броней хранит только последнее состояние и не помнит, как в
+    него пришли. Без этого журнала спор «мы гасили — нет, не гасили»
+    неразрешим. Строки отсюда не редактируются и не удаляются.
+
+    Отдельно от audit_log: тот про действия партнёра в кабинете,
+    этот — про бронь, и пишут в него веб, бот и админка одинаково.
+    """
+    __tablename__ = "booking_events"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    booking_id: Mapped[int] = mapped_column(Integer, index=True)
+    action: Mapped[str] = mapped_column(String(32))          # redeem / cancel / create
+    status_from: Mapped[str] = mapped_column(String(16), default="")
+    status_to: Mapped[str] = mapped_column(String(16), default="")
+    actor_kind: Mapped[str] = mapped_column(String(16), default="")  # staff/guest/admin/system
+    actor_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    actor_name: Mapped[str] = mapped_column(String(128), default="")
+    ip: Mapped[str] = mapped_column(String(64), default="")
+    device: Mapped[str] = mapped_column(String(200), default="")
+    note: Mapped[str] = mapped_column(String(300), default="")
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
 
 
 class PartnerLead(Base):
@@ -100,8 +130,22 @@ class PointsLedger(Base):
 
 
 async def init_db() -> None:
+    """Создаёт недостающие таблицы и доводит схему миграциями.
+
+    create_all() умеет только создавать таблицы целиком: новая колонка
+    в уже существующей таблице через него не появится никогда. Поэтому
+    следом идут миграции — они и доводят живую базу до текущей модели.
+    """
+    # Импорт здесь, а не наверху: models_partner сам импортирует Base отсюда.
+    # Без него create_all не увидит таблицы кабинета — они регистрируются
+    # в метаданных только при импорте модуля, и полнота схемы зависела бы
+    # от того, кто первым позвал init_db: у бота эти модели подтягивались
+    # через handlers, у отдельного процесса — нет.
+    from . import models_partner  # noqa: F401
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    from .migrations import run as run_migrations
+    await run_migrations(engine)
 
 
 async def get_or_create_user(s: AsyncSession, tg_id: int, name: str) -> tuple[User, bool]:

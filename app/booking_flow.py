@@ -23,7 +23,7 @@ from collections import defaultdict
 
 from sqlalchemy import select, update
 
-from .db import Booking, Session, Slot, User, Venue, add_points
+from .db import Booking, BookingEvent, Session, Slot, User, Venue, add_points
 from .models_partner import AuditLog, PartnerUser, VenueProfile
 from .tz import fmt_dt, fmt_slot, msk_now, slot_start_msk, utc_now
 
@@ -104,32 +104,35 @@ def _booking_json(bk: Booking, venue: Venue | None, slot: Slot | None) -> dict:
 
 
 async def _who_redeemed(s, booking_id: int) -> tuple[str, str]:
-    """Кто и когда отметил визит — из журнала действий кабинета.
+    """Кто и когда отметил визит: «отметили 09.09 в 15:12, Марина».
 
-    В самой брони этого не записать: колонок redeemed_at/redeemed_by в
-    таблице нет, а менять схему на живой базе без миграций нельзя.
-    Журнал уже пишется на каждое погашение, и его достаточно, чтобы
-    ответить сотруднику «отметили в 15:12, Марина» вместо «ошибка».
+    Читаем журнал переходов — он помнит и время, и имя того, кто нажал.
+    Если брони погашены до появления журнала, берём то, что записано
+    в самой броне; там имени нет, но время есть.
     """
-    row = await s.scalar(
-        select(AuditLog).where(AuditLog.action == "visit_confirm",
-                               AuditLog.entity == "booking",
-                               AuditLog.entity_id == booking_id)
-        .order_by(AuditLog.id.desc()).limit(1))
-    if not row:
-        return "", ""
-    who = ""
-    if row.partner_user_id:
-        pu = await s.get(PartnerUser, row.partner_user_id)
-        who = pu.name if pu and pu.name else ""
-    return fmt_dt(row.created_at), who
+    ev = await s.scalar(
+        select(BookingEvent).where(BookingEvent.booking_id == booking_id,
+                                   BookingEvent.action == "redeem")
+        .order_by(BookingEvent.id.desc()).limit(1))
+    if ev:
+        return fmt_dt(ev.created_at), ev.actor_name or ""
+
+    bk = await s.get(Booking, booking_id)
+    if bk and bk.redeemed_at:
+        who = ""
+        if bk.redeemed_by:
+            pu = await s.get(PartnerUser, bk.redeemed_by)
+            who = pu.name if pu and pu.name else ""
+        return fmt_dt(bk.redeemed_at), who
+    return "", ""
 
 
 async def redeem(code: str, *, partner_id: int | None = None,
                  partner_user_id: int | None = None,
                  booking_id: int | None = None,
                  enforce_window: bool = True,
-                 admin: bool = False) -> Outcome:
+                 admin: bool = False,
+                 ip: str = "", device: str = "") -> Outcome:
     """Погасить код брони. Единственная точка смены статуса на «visited».
 
     partner_id ограничивает поиск заведениями этого партнёра: код чужой
@@ -215,7 +218,8 @@ async def redeem(code: str, *, partner_id: int | None = None,
         res = await s.execute(
             update(Booking)
             .where(Booking.id == bk_id, Booking.status == "active")
-            .values(status="visited"))
+            .values(status="visited", redeemed_at=utc_now(),
+                    redeemed_by=partner_user_id))
 
         if res.rowcount == 0:
             # Между чтением и записью бронь успели тронуть из другой сессии.
@@ -239,6 +243,19 @@ async def redeem(code: str, *, partner_id: int | None = None,
             guest.visits += 1
             await add_points(s, guest, 30, f"Визит {bk_code}")
 
+        actor_name = ""
+        if partner_user_id:
+            pu = await s.get(PartnerUser, partner_user_id)
+            actor_name = (pu.name if pu else "") or ""
+        s.add(BookingEvent(
+            booking_id=bk_id, action="redeem",
+            status_from="active", status_to="visited",
+            actor_kind="admin" if admin else "staff",
+            actor_id=partner_user_id, actor_name=actor_name,
+            ip=ip[:64], device=device[:200], note=bk_code,
+            created_at=utc_now()))
+        # audit_log остаётся: он про действия партнёра в кабинете, и на него
+        # смотрят существующие экраны. Журнал брони живёт рядом, не вместо.
         s.add(AuditLog(partner_user_id=partner_user_id, partner_id=partner_id,
                        action="visit_confirm", entity="booking", entity_id=bk_id,
                        payload=bk_code))
@@ -247,3 +264,48 @@ async def redeem(code: str, *, partner_id: int | None = None,
         info["status"] = "visited"
         return Outcome(ok=True, booking=info,
                        message=f"Визит отмечен: {info['venue_name']}, {info['when']}.")
+
+
+async def cancel(booking_id: int, *, guest_id: int | None = None,
+                 actor_kind: str = "guest", actor_name: str = "",
+                 ip: str = "", device: str = "") -> Outcome:
+    """Отменить бронь. Вторая точка смены статуса, устроена так же.
+
+    guest_id ограничивает отмену владельцем брони: чужую отменить нельзя.
+    Переход — одним UPDATE с условием, ноль строк означает, что бронь уже
+    закрыта: либо отменена раньше, либо гость успел прийти.
+    """
+    async with Session() as s:
+        bk = await s.get(Booking, booking_id)
+        if not bk or (guest_id is not None and bk.user_id != guest_id):
+            return _fail("not_found", "Бронь не найдена.", http=404)
+
+        venue = await s.get(Venue, bk.venue_id)
+        slot = await s.get(Slot, bk.slot_id)
+        info = _booking_json(bk, venue, slot)
+        bk_id, bk_code, bk_status = bk.id, bk.code, bk.status
+
+        if bk_status == "visited":
+            return _fail("already_visited",
+                         "Визит уже отмечен — отменить бронь нельзя.", booking=info)
+        if bk_status == "cancelled":
+            return _fail("already", "Бронь уже отменена.", booking=info)
+
+        res = await s.execute(
+            update(Booking)
+            .where(Booking.id == bk_id, Booking.status == "active")
+            .values(status="cancelled", cancelled_at=utc_now()))
+        if res.rowcount == 0:
+            await s.rollback()
+            return _fail("conflict", "Бронь только что изменилась — обновите экран.",
+                         booking=info)
+
+        s.add(BookingEvent(
+            booking_id=bk_id, action="cancel",
+            status_from="active", status_to="cancelled",
+            actor_kind=actor_kind, actor_id=guest_id, actor_name=actor_name[:128],
+            ip=ip[:64], device=device[:200], note=bk_code, created_at=utc_now()))
+        await s.commit()
+
+    info["status"] = "cancelled"
+    return Outcome(ok=True, booking=info, message="Бронь отменена.")

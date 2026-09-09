@@ -19,6 +19,8 @@ from sqlalchemy import select
 
 from ..config import CANCEL_FREE_HOURS, DEPOSIT, PTS_REF
 from ..product import DEPOSIT_CHARGED, DISCOUNT_MAX, DISCOUNT_MIN, DISTRICTS
+from .. import booking_flow
+from ..tz import msk_now, slot_start_msk
 from ..db import (Booking, Session, Slot, Venue, add_points,
                   get_or_create_user, venue_weekdays)
 from ..keyboards import (CAT_ICON, CAT_NAME, DAY_BUTTONS, DIST_NAME, BookCB,
@@ -292,15 +294,18 @@ async def my_bookings(c: CallbackQuery):
 
 @router.callback_query(CancelCB.filter())
 async def cancel_booking(c: CallbackQuery, callback_data: CancelCB):
+    out = await booking_flow.cancel(callback_data.booking_id,
+                                    guest_id=c.from_user.id,
+                                    actor_name=c.from_user.first_name or "",
+                                    device="telegram")
+    if not out.ok:
+        return await c.answer(out.message, show_alert=True)
+    b_code = out.booking["code"]
     async with Session() as s:
         b = await s.get(Booking, callback_data.booking_id)
-        if not b or b.user_id != c.from_user.id or b.status != "active":
-            return await c.answer("Бронь не найдена", show_alert=True)
         sl = await s.get(Slot, b.slot_id)
-        b.status = "cancelled"
-        await s.commit()
-    visit_dt = dt.datetime.combine(b.visit_date, dt.time(hour=sl.hour))
-    hours_left = (visit_dt - dt.datetime.now()).total_seconds() / 3600
+        visit_dt = slot_start_msk(b.visit_date, sl.hour)
+    hours_left = (visit_dt - msk_now()).total_seconds() / 3600
     if not DEPOSIT_CHARGED:
         note = "Ничего не списывалось — возвращать нечего."
     elif hours_left >= CANCEL_FREE_HOURS:
@@ -308,7 +313,7 @@ async def cancel_booking(c: CallbackQuery, callback_data: CancelCB):
     else:
         note = f"До визита меньше {CANCEL_FREE_HOURS} ч — деньги за бронь удерживаются."
     await c.answer("Бронь отменена")
-    await c.message.edit_text(f"Бронь <b>{b.code}</b> отменена. {note}",
+    await c.message.edit_text(f"Бронь <b>{b_code}</b> отменена. {note}",
                               reply_markup=kb_back())
 
 
