@@ -22,13 +22,13 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, select
 
 from . import booking_flow, notify
-from .tz import fmt_dt, fmt_slot, msk_today
+from .tz import fmt_dt, fmt_slot, msk_today, utc_now
 from .auth import AuthError, verify_init_data
 from .config import ADMIN_IDS, BOT_TOKEN
-from .db import (Booking, Notification, Session, Slot, User, Venue,
-                 WebSession, add_points)
-from .models_partner import (AuditLog, CabLogin, CabSession, Partner,
-                             PartnerUser, QuietWindow, StaffInvite,
+from .db import (Booking, BookingEvent, Notification, Session, Slot, User,
+                 Venue, WebSession, add_points)
+from .models_partner import (AuditLog, CabLogin, CabSession, ManualReview,
+                             Partner, PartnerUser, QuietWindow, StaffInvite,
                              VenuePhoto, VenueProfile)
 
 router = APIRouter(prefix="/api/cab", tags=["cabinet"])
@@ -726,8 +726,9 @@ async def bookings_today(ctx=Depends(current_user)):
         venue_ids = list(await s.scalars(
             select(VenueProfile.venue_id).where(VenueProfile.partner_id == partner.id)))
         if not venue_ids:
-            return {"date": day.isoformat(), "bookings": [],
-                    "waiting": 0, "arrived": 0, "notifications_blocked": False}
+            return {"date": day.isoformat(), "bookings": [], "waiting": 0,
+                    "arrived": 0, "notifications_blocked": False,
+                    "manual_open": 0}
         rows = (await s.execute(
             select(Booking, Venue, Slot, User)
             .join(Venue, Venue.id == Booking.venue_id)
@@ -738,6 +739,11 @@ async def bookings_today(ctx=Depends(current_user)):
 
         # Заблокировал ли кто-то из сотрудников бота: иначе непонятно,
         # почему уведомления «не приходят», и люди винят сервис.
+        # Открытые случаи «код не прошёл, гостя впустили»: если их не
+        # показать здесь, они осядут в базе и никто не разберёт.
+        manual_open = len(list(await s.scalars(
+            select(ManualReview.id).where(ManualReview.partner_id == partner.id,
+                                          ManualReview.status == "open"))))
         staff_ids = list(await s.scalars(
             select(PartnerUser.tg_id).where(PartnerUser.partner_id == partner.id)))
         blocked = False
@@ -760,6 +766,7 @@ async def bookings_today(ctx=Depends(current_user)):
         "waiting": sum(1 for i in items if i["status"] == "active"),
         "arrived": sum(1 for i in items if i["status"] == "visited"),
         "notifications_blocked": blocked,
+        "manual_open": manual_open,
     }
 
 
@@ -801,3 +808,105 @@ async def redeem_code(body: RedeemIn, request: Request, ctx=Depends(current_user
     if not out.ok:
         raise HTTPException(status_code=out.http, detail=out.message)
     return {"ok": True, "booking": out.booking, "message": out.message}
+
+
+# ---------------------------------------------------------------------
+# ДЕГРАДИРОВАННЫЙ РЕЖИМ: код не проходит, а гость уже стоит на входе
+# ---------------------------------------------------------------------
+
+class ManualIn(BaseModel):
+    code: str = Field(default="", max_length=64)
+    guest_hint: str = Field(default="", max_length=200)
+    reason: str = Field(default="code_failed", max_length=64)
+
+
+@router.post("/bookings/manual")
+async def manual_admit(body: ManualIn, request: Request, ctx=Depends(current_user)):
+    """«Код не проходит» — впустить гостя и разобраться потом.
+
+    Отказ кода не должен решать, впускать ли человека. Он уже пришёл,
+    а не сработать может что угодно: сеть в подвале, опечатка, просроченное
+    окно, наша собственная ошибка. Сотрудник жмёт кнопку, сажает гостя
+    и работает дальше — случай остаётся в разборе.
+
+    Ручка намеренно не проверяет ничего, кроме входа в кабинет: любая
+    дополнительная проверка здесь означала бы, что гостя снова можно
+    не впустить из-за нашей ошибки.
+    """
+    partner, user = ctx["partner"], ctx["user"]
+    meta = _actor(request)
+    booking_id = None
+    async with Session() as s:
+        if body.code:
+            venue_ids = list(await s.scalars(
+                select(VenueProfile.venue_id).where(
+                    VenueProfile.partner_id == partner.id)))
+            if venue_ids:
+                bk = await s.scalar(select(Booking).where(
+                    Booking.code.in_(booking_flow.code_candidates(body.code)),
+                    Booking.venue_id.in_(venue_ids)))
+                booking_id = bk.id if bk else None
+        review = ManualReview(
+            partner_id=partner.id, partner_user_id=user.id,
+            actor_name=user.name or "", raw_code=(body.code or "")[:64],
+            booking_id=booking_id, guest_hint=body.guest_hint[:200],
+            reason=body.reason[:64], status="open",
+            ip=meta["ip"][:64], device=meta["device"][:200],
+            created_at=utc_now())
+        s.add(review)
+        await s.flush()
+        review_id = review.id
+        # Если бронь всё же нашлась, оставляем след и в её журнале:
+        # иначе при разборе непонятно, к чему относился случай.
+        if booking_id:
+            s.add(BookingEvent(
+                booking_id=booking_id, action="manual_admit",
+                status_from="", status_to="",
+                actor_kind="staff", actor_id=user.id,
+                actor_name=user.name or "", ip=meta["ip"][:64],
+                device=meta["device"][:200],
+                note=f"ручной разбор #{review_id}", created_at=utc_now()))
+        await s.commit()
+    return {"ok": True, "id": review_id, "booking_id": booking_id,
+            "message": "Гостя можно впустить. Случай записан — разберём позже."}
+
+
+@router.get("/manual-reviews")
+async def manual_reviews(ctx=Depends(current_user)):
+    """Открытые случаи ручного разбора — владельцу после смены."""
+    partner = ctx["partner"]
+    async with Session() as s:
+        rows = (await s.scalars(
+            select(ManualReview)
+            .where(ManualReview.partner_id == partner.id,
+                   ManualReview.status == "open")
+            .order_by(ManualReview.id.desc()).limit(50))).all()
+    return {"reviews": [{
+        "id": r.id, "code": r.raw_code, "booking_id": r.booking_id,
+        "guest_hint": r.guest_hint, "actor_name": r.actor_name,
+        "created_at": fmt_dt(r.created_at),
+    } for r in rows], "open_count": len(rows)}
+
+
+class ResolveIn(BaseModel):
+    review_id: int
+    note: str = Field(default="", max_length=300)
+
+
+@router.post("/manual-reviews/resolve")
+async def resolve_manual(body: ResolveIn, ctx=Depends(current_user)):
+    """Закрыть случай. Разбирает владелец, не хостес."""
+    if ctx["user"].role != "owner":
+        raise HTTPException(status_code=403, detail="Разбирать может только владелец")
+    async with Session() as s:
+        r = await s.get(ManualReview, body.review_id)
+        if not r or r.partner_id != ctx["partner"].id:
+            raise HTTPException(status_code=404, detail="Случай не найден")
+        if r.status == "resolved":
+            raise HTTPException(status_code=409, detail="Случай уже разобран")
+        r.status = "resolved"
+        r.note = body.note[:300]
+        r.resolved_at = utc_now()
+        r.resolved_by = ctx["user"].id
+        await s.commit()
+    return {"ok": True}

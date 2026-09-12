@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 async def run():
     from app.db import init_db, Session, Venue
     from app.seed import seed
-    from app.keyboards import DayCB, DistCB, CatCB, VenueCB, BookCB, date_for
+    from app.keyboards import DayCB, DistCB, CatCB, VenueCB, BookCB, date_for, day_label
     from app.handlers import guest as gh
     from sqlalchemy import select
 
@@ -30,7 +30,9 @@ async def run():
     cq = make_cq(DayCB(day=2, dist="all", cat="all"))
     await gh.feed_day(cq, DayCB(day=2, dist="all", cat="all"))
     text, kb = cq.message.edit_text.call_args[0][0], cq.message.edit_text.call_args[1]["reply_markup"]
-    assert "чт" in text or "пт" in text or "20" in text or "21" in text, text[:80]
+    # Раньше тут были захардкожены «чт/пт/20/21» — тест жил только до
+    # следующей недели. Сверяем с тем же ярлыком, что рисует сам бот.
+    assert day_label(2) in text, f"ожидали «{day_label(2)}»: {text[:80]}"
     print("OK шаг 1: выбор дня работает —", text.splitlines()[0])
 
     # 2) гость выбирает район

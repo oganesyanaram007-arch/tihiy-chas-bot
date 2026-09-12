@@ -155,10 +155,44 @@ async def _m0003_notifications(conn) -> None:
                        "status, next_attempt_at")
 
 
+async def _m0004_manual_reviews(conn) -> None:
+    """Ручной разбор: гость на входе, а код не проходит.
+
+    Отказ кода не должен решать, впускать ли человека. Он уже пришёл,
+    у него бронь, а не сработать может что угодно: сеть в подвале,
+    опечатка, просроченное окно, наша собственная ошибка. Сотрудник
+    жмёт «код не проходит», сажает гостя и идёт работать, а случай
+    остаётся здесь — разобрать потом, на трезвую голову.
+
+    Отдельная таблица, а не событие брони: брони может не существовать
+    вовсе, а разобраться всё равно нужно.
+    """
+    await create_table(conn, "manual_reviews", """
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        partner_id INTEGER NOT NULL,
+        partner_user_id INTEGER,
+        actor_name VARCHAR(128) DEFAULT '',
+        raw_code VARCHAR(64) DEFAULT '',
+        booking_id INTEGER,
+        guest_hint VARCHAR(200) DEFAULT '',
+        reason VARCHAR(64) DEFAULT '',
+        status VARCHAR(16) NOT NULL DEFAULT 'open',
+        note VARCHAR(300) DEFAULT '',
+        ip VARCHAR(64) DEFAULT '',
+        device VARCHAR(200) DEFAULT '',
+        created_at DATETIME NOT NULL,
+        resolved_at DATETIME,
+        resolved_by INTEGER
+    """)
+    await create_index(conn, "ix_manual_reviews_partner", "manual_reviews",
+                       "partner_id, status")
+
+
 MIGRATIONS: list[tuple[str, object]] = [
     ("0001_booking_redemption", _m0001_booking_redemption),
     ("0002_booking_events", _m0002_booking_events),
     ("0003_notifications", _m0003_notifications),
+    ("0004_manual_reviews", _m0004_manual_reviews),
 ]
 
 

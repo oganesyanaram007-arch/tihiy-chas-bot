@@ -145,3 +145,31 @@ class CabSession(Base):
     expires_at: Mapped[dt.datetime] = mapped_column(DateTime)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
     last_seen: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+
+class ManualReview(Base):
+    """Случай «гость на входе, а код не проходит».
+
+    Отказ кода не должен решать, впускать ли человека: он уже пришёл,
+    а не сработать может что угодно — сеть в подвале, опечатка, наша
+    собственная ошибка. Сотрудник жмёт «код не проходит», сажает гостя
+    и работает дальше; случай остаётся здесь, разобрать его можно потом.
+
+    Отдельно от booking_events: брони может не найтись вовсе, а разбирать
+    всё равно нужно — событие не к чему было бы привязать.
+    """
+    __tablename__ = "manual_reviews"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    partner_id: Mapped[int] = mapped_column(Integer, index=True)
+    partner_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    actor_name: Mapped[str] = mapped_column(String(128), default="")
+    raw_code: Mapped[str] = mapped_column(String(64), default="")
+    booking_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    guest_hint: Mapped[str] = mapped_column(String(200), default="")
+    reason: Mapped[str] = mapped_column(String(64), default="")
+    status: Mapped[str] = mapped_column(String(16), default="open")  # open / resolved
+    note: Mapped[str] = mapped_column(String(300), default="")
+    ip: Mapped[str] = mapped_column(String(64), default="")
+    device: Mapped[str] = mapped_column(String(200), default="")
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+    resolved_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    resolved_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
