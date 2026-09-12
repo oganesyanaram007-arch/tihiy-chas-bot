@@ -22,7 +22,7 @@ import secrets
 import time
 from collections import defaultdict
 
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 
 from .db import Booking, BookingEvent, Session, Slot, User, Venue, add_points
 from .product import CODE_ALPHABET, CODE_LEGACY_PREFIX, CODE_LENGTH
@@ -364,3 +364,74 @@ async def cancel(booking_id: int, *, guest_id: int | None = None,
 
     info["status"] = "cancelled"
     return Outcome(ok=True, booking=info, message="Бронь отменена.")
+
+
+DEFAULT_CAPACITY = 4     # если партнёр не задал лимит мест в тихом окне
+
+
+async def _capacity(s, venue_id: int, hour: int, weekday: int) -> int:
+    from .models_partner import QuietWindow
+    cap = await s.scalar(select(QuietWindow.capacity).where(
+        QuietWindow.venue_id == venue_id, QuietWindow.weekday == weekday,
+        QuietWindow.hour == hour, QuietWindow.active.is_(True)))
+    return cap if cap is not None else DEFAULT_CAPACITY
+
+
+async def create(user_id: int, venue_id: int, slot_id: int, visit_date: dt.date,
+                 hour: int, *, actor_kind: str = "guest", actor_name: str = "",
+                 ip: str = "", device: str = "") -> Outcome:
+    """Создать бронь. Третья точка смены статуса, тоже атомарная.
+
+    Лимит мест проверялся чтением с последующей записью, а между ними
+    оставалась щель. Внутрипроцессная блокировка закрывала её только
+    внутри одного процесса, а брони создают два: API и бот. Причём бот
+    лимит не проверял вовсе — гость из Telegram мог занять стол сверх
+    ёмкости, и заведение узнавало об этом на входе.
+
+    Теперь проверка и вставка — один INSERT ... SELECT ... WHERE. База
+    сама не даст двум запросам пройти мимо друг друга, сколько бы
+    процессов ни работало.
+    """
+    async with Session() as s:
+        cap = await _capacity(s, venue_id, hour, visit_date.weekday())
+        code = await new_code(s)
+        now = utc_now()
+
+        res = await s.execute(text("""
+            INSERT INTO bookings
+                (code, user_id, venue_id, slot_id, visit_date, status, created_at)
+            SELECT :code, :uid, :vid, :sid, :day, 'active', :now
+            WHERE (SELECT COUNT(*) FROM bookings
+                   WHERE venue_id = :vid AND slot_id = :sid
+                     AND visit_date = :day AND status = 'active') < :cap
+              AND NOT EXISTS (SELECT 1 FROM bookings
+                   WHERE user_id = :uid AND venue_id = :vid AND slot_id = :sid
+                     AND visit_date = :day AND status = 'active')
+        """), {"code": code, "uid": user_id, "vid": venue_id, "sid": slot_id,
+               "day": visit_date, "now": now, "cap": cap})
+
+        if res.rowcount == 0:
+            # Вставка не прошла — разбираемся, что именно помешало, чтобы
+            # гость увидел причину, а не общую ошибку.
+            await s.rollback()
+            async with Session() as s2:
+                mine = await s2.scalar(select(Booking.id).where(
+                    Booking.user_id == user_id, Booking.venue_id == venue_id,
+                    Booking.slot_id == slot_id, Booking.visit_date == visit_date,
+                    Booking.status == "active"))
+            if mine:
+                return _fail("duplicate", "Вы уже забронировали это окно.")
+            return _fail("no_seats", "Все места на это время разобрали.")
+
+        bk = await s.scalar(select(Booking).where(Booking.code == code))
+        s.add(BookingEvent(booking_id=bk.id, action="create",
+                           status_from="", status_to="active",
+                           actor_kind=actor_kind, actor_id=user_id,
+                           actor_name=actor_name[:128], ip=ip[:64],
+                           device=device[:200], note=code, created_at=now))
+        await s.commit()
+        venue = await s.get(Venue, venue_id)
+        slot = await s.get(Slot, slot_id)
+        info = _booking_json(bk, venue, slot)
+
+    return Outcome(ok=True, booking=info, message="Место закреплено.")

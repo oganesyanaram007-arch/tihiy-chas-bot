@@ -244,19 +244,28 @@ async def book(c: CallbackQuery, callback_data: BookCB):
         v = await s.get(Venue, slot.venue_id)
         u, _ = await get_or_create_user(s, c.from_user.id,
                                         c.from_user.first_name or "Гость")
-        # Тот же генератор, что и в вебе: раньше бот выдавал random без
-        # проверки уникальности — при совпадении бронь падала с 500.
-        code = await booking_flow.new_code(s)
-        visit_date = date_for(callback_data.day)
-        s.add(Booking(code=code, user_id=u.id, venue_id=v.id, slot_id=slot.id,
-                      visit_date=visit_date))
         await s.commit()
+        venue_id, venue_name, venue_cat = v.id, v.name, v.cat
+        venue_place, slot_hour, slot_disc = v.place, slot.hour, slot.discount
+
+    visit_date = date_for(callback_data.day)
+    # Через booking_flow, а не своей вставкой: раньше бот не проверял лимит
+    # мест вовсе, и гость из Telegram занимал стол сверх ёмкости — заведение
+    # узнавало об этом уже на входе.
+    out = await booking_flow.create(u.id, venue_id, callback_data.slot_id,
+                                    visit_date, slot_hour,
+                                    actor_name=c.from_user.first_name or "",
+                                    device="telegram")
+    if not out.ok:
+        return await c.answer(out.message, show_alert=True)
+    code = out.booking["code"]
+
     when = day_label(callback_data.day)
     date_str = visit_date.strftime("%d.%m")
     caption = (f"✅ <b>Место закреплено!</b>\n\n"
-               f"{CAT_ICON.get(v.cat,'•')} <b>{v.name}</b> · {v.place}\n"
-               f"🕑 {when} ({date_str}), {slot.hour}:00–{slot.hour+1}:00\n"
-               f"🏷 Скидка −{slot.discount}% на весь счёт\n"
+               f"{CAT_ICON.get(venue_cat,'•')} <b>{venue_name}</b> · {venue_place}\n"
+               f"🕑 {when} ({date_str}), {slot_hour}:00–{slot_hour+1}:00\n"
+               f"🏷 Скидка −{slot_disc}% на весь счёт\n"
                f"Код брони: <b>{code}</b>\n\n"
                f"При входе назовите этот код сотруднику — он отметит визит. "
                f"Если так быстрее, покажите QR выше: сотрудник считает его "

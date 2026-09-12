@@ -21,7 +21,6 @@ import base64
 import datetime as dt
 import html
 import io
-from asyncio import Lock
 from collections import OrderedDict, defaultdict
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
@@ -55,10 +54,6 @@ DIST_NAME = {
     "krasnos": "Красносельский", "push": "Пушкинский",
 }
 
-# Единственный uvicorn-воркер, поэтому внутрипроцессной блокировки достаточно,
-# чтобы два гостя не забрали последний стол одновременно. При переезде на
-# несколько воркеров это место меняется на блокировку в БД.
-_slot_locks: dict[tuple[int, int, str], Lock] = defaultdict(Lock)
 
 
 async def current_guest(x_init_data: str = Header(default="", alias="X-Init-Data")):
@@ -350,7 +345,7 @@ class BookIn(BaseModel):
 
 
 @router.post("/bookings")
-async def create_booking(body: BookIn,
+async def create_booking(body: BookIn, request: Request,
                          x_init_data: str = Header(default="", alias="X-Init-Data")):
     guest = await current_guest(x_init_data)
     try:
@@ -377,50 +372,30 @@ async def create_booking(body: BookIn,
         venue_id, venue_name = venue.id, venue.name
         slot_id, slot_disc = slot.id, slot.discount
 
-    key = (body.venue_id, body.hour, body.date)
-    async with _slot_locks[key]:
-        async with Session() as s:
-            dup = await s.scalar(
-                select(func.count(Booking.id)).where(
-                    Booking.user_id == guest.id, Booking.venue_id == body.venue_id,
-                    Booking.slot_id == slot_id, Booking.visit_date == day,
-                    Booking.status == "active")
-            )
-            if dup:
-                raise HTTPException(status_code=409, detail="Вы уже забронировали это окно")
+    # Лимит мест проверяет booking_flow одним INSERT с условием: раньше
+    # здесь были чтение и запись под внутрипроцессным локом, который держал
+    # только этот процесс, а брони создаёт ещё и бот.
+    out = await booking_flow.create(guest.id, venue_id, slot_id, day, body.hour,
+                                    actor_name=guest.name or "",
+                                    ip=(request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+                                        or (request.client.host if request.client else "")),
+                                    device=request.headers.get("user-agent", ""))
+    if not out.ok:
+        raise HTTPException(status_code=409, detail=out.message)
 
-            caps = await _capacity_map(s, [venue_id], day.weekday())
-            cap = caps.get((venue_id, body.hour), DEFAULT_CAPACITY)
-            taken = await s.scalar(
-                select(func.count(Booking.id)).where(
-                    Booking.venue_id == venue_id, Booking.slot_id == slot_id,
-                    Booking.visit_date == day, Booking.status == "active")
-            ) or 0
-            if taken >= cap:
-                raise HTTPException(status_code=409, detail="Все места на это время разобрали")
+    code, bk_id = out.booking["code"], out.booking["id"]
+    async with Session() as s:
+        user = await s.get(User, guest.id)
+        if body.pay_with_points:
+            if user.points < DEPOSIT:
+                raise HTTPException(status_code=402, detail="Недостаточно баллов")
+            await add_points(s, user, -DEPOSIT, "deposit_points")
+        await add_points(s, user, POINTS_PER_BOOKING, "booking")
+        await _queue_partner_note(s, bk_id, venue_id, venue_name, body.hour,
+                                  slot_disc, day, code, guest.name)
+        await s.commit()
+        points = user.points
 
-            user = await s.get(User, guest.id)
-            if body.pay_with_points:
-                if user.points < DEPOSIT:
-                    raise HTTPException(status_code=402, detail="Недостаточно баллов")
-                await add_points(s, user, -DEPOSIT, "deposit_points")
-
-            code = await booking_flow.new_code(s)
-
-            bk = Booking(code=code, user_id=user.id, venue_id=venue_id,
-                         slot_id=slot_id, visit_date=day, status="active")
-            s.add(bk)
-            await s.flush()                 # нужен id брони для очереди и журнала
-            await add_points(s, user, POINTS_PER_BOOKING, "booking")
-            s.add(BookingEvent(booking_id=bk.id, action="create",
-                               status_from="", status_to="active",
-                               actor_kind="guest", actor_id=user.id,
-                               actor_name=user.name or "", note=code,
-                               created_at=utc_now()))
-            await _queue_partner_note(s, bk.id, venue_id, venue_name, body.hour,
-                                      slot_disc, day, code, guest.name)
-            await s.commit()
-            bk_id, points = bk.id, user.points
     return {"ok": True, "id": bk_id, "code": code, "discount": slot_disc,
             "points": points, "deposit": DEPOSIT}
 
