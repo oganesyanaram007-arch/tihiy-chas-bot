@@ -16,7 +16,8 @@ from aiogram.types import (BufferedInputFile, CallbackQuery,
                            InlineKeyboardMarkup, Message)
 from sqlalchemy import select
 
-from ..config import CANCEL_FREE_HOURS, DEPOSIT, PTS_REF
+from ..config import (CANCEL_FREE_HOURS, DEPOSIT, PTS_NEW_MULT,
+                      PTS_REF, PTS_VISIT)
 from ..product import DEPOSIT_CHARGED, DISCOUNT_MAX, DISCOUNT_MIN, DISTRICTS
 from .. import booking_flow
 from ..tz import msk_now, slot_start_msk
@@ -340,7 +341,7 @@ async def points(c: CallbackQuery, bot_username: str):
     link = f"https://t.me/{bot_username}?start=ref_{c.from_user.id}"
     await c.message.edit_text(
         f"✨ <b>Тихие баллы: {u.points}</b>\n{goal}\n\n"
-        f"• +10 баллов за каждый визит, ×2 — за новое заведение\n"
+        f"• +{PTS_VISIT} баллов за каждый визит, ×{PTS_NEW_MULT} — за новое заведение\n"
         f"• {DEPOSIT} баллов = депозит в подарок\n"
         f"• Статус «Свой» за 6 визитов: {u.visits} / 6\n\n"
         f"Пригласите друга — по +{PTS_REF} баллов обоим:\n{link}",

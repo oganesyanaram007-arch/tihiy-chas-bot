@@ -82,7 +82,9 @@ async def run():
         await add_points(s, guest, pts, f"Визит {code}")
         await s.commit()
 
-        assert guest.points == PTS_REF + 20, guest.points
+        # Сколько именно — из общего модуля, а не числом в тесте:
+        # раньше тут было 20, и при смене правила тест бы это скрыл.
+        assert guest.points == PTS_REF + pts, (guest.points, PTS_REF, pts)
         assert friend.points == PTS_REF
         assert b.status == "visited" and guest.visits == 1
 

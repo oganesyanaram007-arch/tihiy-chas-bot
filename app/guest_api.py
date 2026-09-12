@@ -44,7 +44,7 @@ from .tz import MSK, fmt_slot, msk_now, msk_today, utc_now  # noqa: E402
 
 from .product import DEPOSIT, DEPOSIT_CHARGED, HORIZON_DAYS  # noqa: E402
 DEFAULT_CAPACITY = 4    # если партнёр не задал лимит мест в тихом окне
-POINTS_PER_BOOKING = 20 # начисление за визит происходит в боте, здесь — за бронь
+from .product import POINTS_PER_BOOKING  # noqa: E402
 
 DIST_NAME = {
     "petro": "Петроградский", "centr": "Центральный", "adm": "Адмиралтейский",

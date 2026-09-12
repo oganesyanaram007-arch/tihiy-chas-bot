@@ -22,10 +22,11 @@ import secrets
 import time
 from collections import defaultdict
 
-from sqlalchemy import select, text, update
+from sqlalchemy import func, select, text, update
 
 from .db import Booking, BookingEvent, Session, Slot, User, Venue, add_points
-from .product import CODE_ALPHABET, CODE_LEGACY_PREFIX, CODE_LENGTH
+from .product import (CODE_ALPHABET, CODE_LEGACY_PREFIX, CODE_LENGTH,
+                      POINTS_NEW_VENUE_MULT, POINTS_PER_VISIT)
 from .models_partner import AuditLog, PartnerUser, VenueProfile
 from .tz import fmt_dt, fmt_slot, msk_now, slot_start_msk, utc_now
 
@@ -296,7 +297,15 @@ async def redeem(code: str, *, partner_id: int | None = None,
         guest = await s.get(User, bk_user)
         if guest:
             guest.visits += 1
-            await add_points(s, guest, 30, f"Визит {bk_code}")
+            # ×2 за первое посещение нового заведения: ради этого витрина
+            # и существует — гость должен пробовать места, а не ходить
+            # в одно и то же. Считаем по уже отмеченным визитам, не включая
+            # текущий: его UPDATE прошёл строкой выше.
+            seen = await s.scalar(select(func.count(Booking.id)).where(
+                Booking.user_id == bk_user, Booking.venue_id == bk.venue_id,
+                Booking.status == "visited", Booking.id != bk_id))
+            pts = POINTS_PER_VISIT * (POINTS_NEW_VENUE_MULT if not seen else 1)
+            await add_points(s, guest, pts, f"Визит {bk_code}")
 
         actor_name = ""
         if partner_user_id:

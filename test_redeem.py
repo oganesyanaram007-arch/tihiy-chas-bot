@@ -199,6 +199,51 @@ async def run():
 
     await run_codes(D, c, msk_today, select)
 
+    print("\n18. Баллы за визит — одно правило на весь продукт")
+    from app.product import POINTS_NEW_VENUE_MULT, POINTS_PER_VISIT
+    from app.config import PTS_VISIT, PTS_NEW_MULT
+    from app.db import PointsLedger
+    assert PTS_VISIT == POINTS_PER_VISIT, (PTS_VISIT, POINTS_PER_VISIT)
+    assert PTS_NEW_MULT == POINTS_NEW_VENUE_MULT
+    # Гость, который тут ещё не был: первое посещение идёт с удвоением.
+    async with Session() as s:
+        v3 = Venue(name="Новое место", cat="food", district="petro", place="тест",
+                   check_note="", left_note="", weekdays="0,1,2,3,4,5,6", active=True)
+        s.add(v3); await s.flush()
+        s.add(VenueProfile(venue_id=v3.id, partner_id=D["b"]["partner"], status="active"))
+        sl3 = Slot(venue_id=v3.id, hour=msk_now().hour, discount=30)
+        s.add(sl3); await s.flush()
+        fresh = User(id=555777, name="Новичок"); s.add(fresh)
+        bk3 = Booking(code="PTS111", user_id=fresh.id, venue_id=v3.id,
+                      slot_id=sl3.id, visit_date=msk_today(), status="active")
+        s.add(bk3); await s.flush()
+        bk3_id, v3_id, sl3_id = bk3.id, v3.id, sl3.id
+        await s.commit()
+    booking_flow.reset_attempts(D["b"]["pu"])
+    out = await booking_flow.redeem("PTS111", partner_id=D["b"]["partner"],
+                                    partner_user_id=D["b"]["pu"])
+    assert out.ok, out.message
+    async with Session() as s:
+        first_award = await s.scalar(select(PointsLedger.delta).where(
+            PointsLedger.user_id == 555777).order_by(PointsLedger.id.desc()).limit(1))
+    assert first_award == POINTS_PER_VISIT * POINTS_NEW_VENUE_MULT, first_award
+    OK(f"первое посещение нового заведения: {first_award} = "
+       f"{POINTS_PER_VISIT} × {POINTS_NEW_VENUE_MULT}")
+
+    # Второй визит в то же заведение — без удвоения.
+    async with Session() as s:
+        bk4 = Booking(code="PTS222", user_id=555777, venue_id=v3_id,
+                      slot_id=sl3_id, visit_date=msk_today(), status="active")
+        s.add(bk4); await s.commit()
+    out = await booking_flow.redeem("PTS222", partner_id=D["b"]["partner"],
+                                    partner_user_id=D["b"]["pu"])
+    assert out.ok, out.message
+    async with Session() as s:
+        second = await s.scalar(select(PointsLedger.delta).where(
+            PointsLedger.user_id == 555777).order_by(PointsLedger.id.desc()).limit(1))
+    assert second == POINTS_PER_VISIT, second
+    OK(f"повторный визит туда же: {second} без удвоения")
+
     print("\nВСЁ ПРОШЛО")
 
 

@@ -25,8 +25,10 @@ from .product import (          # noqa: E402
     HORIZON_DAYS as BOOKING_DAYS_AHEAD,
 )
 
-# Баллы лояльности — пока не часть общего модуля: значения расходятся
-# между ботом и кабинетом, это отдельное продуктовое решение.
-PTS_VISIT = 10         # баллов за подтверждённый визит
-PTS_NEW_MULT = 2       # ×2 за первый визит в новое заведение
-PTS_REF = 200          # рефералка: обоим
+# Баллы тоже из общего модуля: правил было три и все разные — гостю
+# обещали одно, начислялось другое, бот считал по-третьему.
+from .product import (           # noqa: E402
+    POINTS_PER_VISIT as PTS_VISIT,
+    POINTS_NEW_VENUE_MULT as PTS_NEW_MULT,
+    POINTS_REFERRAL as PTS_REF,
+)
